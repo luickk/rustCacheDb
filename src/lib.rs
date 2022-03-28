@@ -2,6 +2,10 @@ use std::io::prelude::*;
 use std::thread;
 use std::net::{TcpStream, TcpListener, SocketAddr};
 
+pub enum CacheDbError {
+    KeyNotFound,
+}
+
 pub struct KeyValObj<KeyT, ValT> {
     key: KeyT,
     val: ValT,
@@ -10,18 +14,16 @@ pub struct KeyValObj<KeyT, ValT> {
 pub struct CacheDb<KeyT, ValT> {
     ipv4_addr: [u8; 4],
     port: u16,
-    cache_size: u16,
 
     key_val_store: Vec<Box<KeyValObj<KeyT, ValT>>>
 }
 
-impl<KeyT, ValT> CacheDb<KeyT, ValT> {
+impl<KeyT: std::cmp::PartialEq, ValT> CacheDb<KeyT, ValT> {
 
-    pub fn new(ipv4_addr: [u8;4], port: u16, cache_size: u16) -> CacheDb<KeyT, ValT> {
+    pub fn new(ipv4_addr: [u8;4], port: u16) -> CacheDb<KeyT, ValT> {
         let cache = CacheDb {
             ipv4_addr: ipv4_addr, 
             port: port,
-            cache_size: cache_size,
             key_val_store: Vec::new()
         };
         cache
@@ -38,6 +40,16 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> {
             }
         }
         None   
+    }
+
+    pub fn set(&mut self, key: KeyT, val: ValT) -> Result<(), CacheDbError> {
+        for obj in self.key_val_store.iter_mut() {
+            if obj.key == key {
+                obj.val = val;
+                return Ok(());
+            }
+        }
+        Err(CacheDbError::KeyNotFound)
     }
 
     fn client_handler(mut socket: TcpStream){
@@ -80,10 +92,42 @@ mod tests {
     }
 
     #[test]
-    fn server_test() { 
-        let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080, 200);
+    fn basic_server_test() { 
+        let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
         let _test_server_instance = thread::spawn(move || (cache.server_client_handler()));
         thread::sleep(time::Duration::from_secs(1));
         basic_client_test();
+    }
+
+    #[test]
+    fn local_cache_db_test() { 
+        let mut cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
+
+        cache.push(KeyValObj{key: String::from("brian"), val: String::from("test")});
+        cache.push(KeyValObj{key: String::from("paul"), val: String::from("test")});
+        cache.push(KeyValObj{key: String::from("pete"), val: String::from("test")});
+        cache.push(KeyValObj{key: String::from("robert"), val: String::from("test")});
+
+        let get_res = cache.get(String::from("brian")).unwrap();
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+        let get_res = cache.get(String::from("paul")).unwrap();
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+        let get_res = cache.get(String::from("pete")).unwrap();
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+        let get_res = cache.get(String::from("robert")).unwrap();
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+
+        if let None = cache.get(String::from("ian")) {
+            println!("Ian not found!");
+        } else {
+            panic!("local get() test failed");
+        }
+
+        if let Err(_e) = cache.set(String::from("robert"), String::from("mod_test")) {
+            panic!("set test failed");
+        }
+        let get_res = cache.get(String::from("robert")).unwrap();
+        println!("mod get k: {} v: {}", get_res.key, get_res.val);
+
     }
 }
