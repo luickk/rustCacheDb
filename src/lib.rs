@@ -1,6 +1,7 @@
 use std::io::prelude::*;
 use std::thread;
 use std::net::{TcpStream, TcpListener, SocketAddr};
+use std::marker::PhantomData;
 
 pub enum CacheDbError {
     KeyNotFound,
@@ -17,6 +18,62 @@ pub struct CacheDb<KeyT, ValT> {
 
     key_val_store: Vec<Box<KeyValObj<KeyT, ValT>>>
 }
+
+pub struct CacheClient<KeyT, ValT> {
+    ipv4_addr: [u8; 4],
+    port: u16,
+
+    tcp_conn: TcpStream,
+
+    pd_k: PhantomData<KeyT>,
+    pd_v: PhantomData<ValT>
+}
+
+pub trait GenericKeyVal {
+    fn get_size(&self) -> u16;
+    fn get_bytes(&self) -> Vec<u8>;
+}
+
+impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal, ValT: GenericKeyVal {
+    pub fn create_connect(ipv4_addr: [u8;4], port: u16) ->  Result<CacheClient<KeyT, ValT>, std::io::Error> {
+        let addr = SocketAddr::from((ipv4_addr, port));
+        let tcp_stream = TcpStream::connect(addr);
+        if let Err(e) = tcp_stream {
+            return Err(e);
+        } else if let Ok(stream) = tcp_stream {
+            let cache_client = CacheClient {
+                ipv4_addr: ipv4_addr, 
+                port: port,
+                tcp_conn: stream,
+                pd_k: PhantomData,
+                pd_v: PhantomData
+            };
+            return Ok(cache_client);
+        }
+        panic!("create_connect returned neither err nor succ");
+    }
+
+    // pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
+    // }
+
+    pub fn assemble_send_buff(op_code: u8, obj: KeyValObj<KeyT, ValT>) -> Vec<u8> {
+        let mut buff = Vec::<u8>::new();
+        buff.push(op_code);
+
+        let key_size: [u8; 2] = obj.key.get_size().to_be_bytes();
+        buff.extend_from_slice(&key_size);
+        let mut key_bytes = obj.key.get_bytes();
+        buff.append(&mut key_bytes);
+
+        let val_size: [u8; 2] = obj.val.get_size().to_be_bytes();
+        buff.extend_from_slice(&val_size);
+        let mut val_bytes = obj.val.get_bytes();
+        buff.append(&mut val_bytes);
+
+        buff
+    }
+}
+
 
 impl<KeyT: std::cmp::PartialEq, ValT> CacheDb<KeyT, ValT> {
 
@@ -60,7 +117,7 @@ impl<KeyT: std::cmp::PartialEq, ValT> CacheDb<KeyT, ValT> {
         println!("read: {:?}", buf);
     }
 
-    pub fn server_client_handler(&self) {
+    pub fn cache_db_server(&self) {
         let addr = SocketAddr::from((self.ipv4_addr, self.port));
         let listener = TcpListener::bind(addr).unwrap();
 
@@ -86,15 +143,25 @@ mod tests {
 
     use super::*;
 
+    impl GenericKeyVal for String {
+        fn get_size(self: &String) -> u16 {
+            100
+        }
+        fn get_bytes(self: &String) -> Vec<u8> {
+            Vec::<u8>::new()
+        }
+    }
+
     fn basic_client_test() {
-        let mut stream = TcpStream::connect("127.0.0.1:8080").unwrap();
-        stream.write(&[1]).unwrap();
+
+        let _cache_client = CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
+
     }
 
     #[test]
     fn basic_server_test() { 
         let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
-        let _test_server_instance = thread::spawn(move || (cache.server_client_handler()));
+        let _test_server_instance = thread::spawn(move || (cache.cache_db_server()));
         thread::sleep(time::Duration::from_secs(1));
         basic_client_test();
     }
