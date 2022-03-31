@@ -7,6 +7,12 @@ pub enum CacheDbError {
     KeyNotFound,
 }
 
+pub enum ProtOpCode {
+    PullOp = 0,
+    PushOp = 1,
+    PullReplyOp = 2
+}
+
 pub struct KeyValObj<KeyT, ValT> {
     key: KeyT,
     val: ValT,
@@ -30,7 +36,7 @@ pub struct CacheClient<KeyT, ValT> {
 }
 
 pub trait GenericKeyVal {
-    fn get_size(&self) -> u16;
+    fn get_size(&self) -> usize;
     fn get_bytes(&self) -> Vec<u8>;
 }
 
@@ -53,19 +59,28 @@ impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal, ValT: Generi
         panic!("create_connect returned neither err nor succ");
     }
 
-    // pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
-    // }
+    pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
+        let send_buff = CacheClient::assemble_send_buff(ProtOpCode::PushOp, obj);
+        println!("test: {:?}", send_buff);
+    }
 
-    pub fn assemble_send_buff(op_code: u8, obj: KeyValObj<KeyT, ValT>) -> Vec<u8> {
+    fn prot_op_code_to_u8(op_code: ProtOpCode) -> u8 {
+        match op_code {
+            ProtOpCode::PushOp => 2,
+            ProtOpCode::PullOp => 1,
+            ProtOpCode::PullReplyOp => 3,
+        }
+    }
+    fn assemble_send_buff(op_code: ProtOpCode, obj: KeyValObj<KeyT, ValT>) -> Vec<u8> {
         let mut buff = Vec::<u8>::new();
-        buff.push(op_code);
+        buff.push(CacheClient::<KeyT, ValT>::prot_op_code_to_u8(op_code));
 
-        let key_size: [u8; 2] = obj.key.get_size().to_be_bytes();
+        let key_size = obj.key.get_size().to_be_bytes();
         buff.extend_from_slice(&key_size);
         let mut key_bytes = obj.key.get_bytes();
         buff.append(&mut key_bytes);
 
-        let val_size: [u8; 2] = obj.val.get_size().to_be_bytes();
+        let val_size = obj.val.get_size().to_be_bytes();
         buff.extend_from_slice(&val_size);
         let mut val_bytes = obj.val.get_bytes();
         buff.append(&mut val_bytes);
@@ -144,18 +159,21 @@ mod tests {
     use super::*;
 
     impl GenericKeyVal for String {
-        fn get_size(self: &String) -> u16 {
-            100
+        fn get_size(self: &String) -> usize {
+            self.chars().count()
         }
+
+        // must clone string since into_bytes() is not implemented for 
+        // the string reference (at least not the copy trait which is required)
         fn get_bytes(self: &String) -> Vec<u8> {
-            Vec::<u8>::new()
+            let str_bytes = self.clone();
+            str_bytes.into_bytes()
         }
     }
 
     fn basic_client_test() {
-
-        let _cache_client = CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
-
+        let mut cache_client = CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
+        cache_client.push(KeyValObj{key: String::from("brian"), val: String::from("test")});
     }
 
     #[test]
