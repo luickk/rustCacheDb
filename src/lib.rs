@@ -1,15 +1,19 @@
 use std::io::prelude::*;
+use std::io;
+use std::fmt::Debug;
 use std::thread;
 use std::net::{TcpStream, TcpListener, SocketAddr};
 use std::marker::PhantomData;
-use std::str::Utf8Error;
 
 const TCP_READ_BUFF_SIZE: usize = 1024;
 
+#[derive(Debug)] 
 pub enum CacheDbError {
     KeyNotFound,
     ParsingErr,
     DecodingErr,
+    ProtocolSizeBufferOverflow,
+    NetworkError,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -32,8 +36,6 @@ pub struct CacheDb<KeyT, ValT> {
 }
 
 pub struct CacheProtocol<KeyT, ValT> {
-    // points to the byte currently read 
-    parse_pointer: u8,
     // points to the segment currently read
     parse_segment_pointer: u8,
     key_size: u16,
@@ -45,9 +47,6 @@ pub struct CacheProtocol<KeyT, ValT> {
 
 
 pub struct CacheClient<KeyT, ValT> {
-    ipv4_addr: [u8; 4],
-    port: u16,
-
     tcp_conn: TcpStream,
 
     pd_k: PhantomData<KeyT>,
@@ -55,7 +54,7 @@ pub struct CacheClient<KeyT, ValT> {
 }
 
 pub trait GenericKeyVal<Val> {
-    fn get_size(&self) -> usize;
+    fn get_size(&self) -> Result<u16, CacheDbError>;
     fn get_bytes(&self) -> Vec<u8>;
     fn from_bytes(data: &[u8]) -> Result<Val, CacheDbError>;
 }
@@ -78,18 +77,18 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
         }
     }
 
-    fn assemble_buff(op_code: ProtOpCode, obj: &KeyValObj<KeyT, ValT>) -> Vec<u8> {
+    pub fn assemble_buff(op_code: ProtOpCode, obj: &KeyValObj<KeyT, ValT>) -> Result<Vec<u8>, CacheDbError> {
         let mut buff = Vec::<u8>::new();
         buff.push(CacheProtocol::<KeyT, ValT>::prot_op_code_to_u8(&op_code));
 
-        let key_size = obj.key.get_size().to_be_bytes();
+        let key_size = obj.key.get_size()?.to_be_bytes();
         buff.extend_from_slice(&key_size);
         let mut key_bytes = obj.key.get_bytes();
         buff.append(&mut key_bytes);
 
-        let val_size: [u8; 2] = [0,0];
+        let mut val_size: [u8; 2] = [0,0];
         if op_code != ProtOpCode::PullOp {
-            let val_size = obj.val.get_size().to_be_bytes();
+            val_size = obj.val.get_size()?.to_be_bytes();
         }
         buff.extend_from_slice(&val_size);
         if op_code != ProtOpCode::PullOp {
@@ -97,13 +96,12 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
             buff.append(&mut val_bytes);
         }
 
-        buff
+        Ok(buff)
     }
 
 
-    fn new() -> CacheProtocol<KeyT, ValT> {
+    pub fn new() -> CacheProtocol<KeyT, ValT> {
         CacheProtocol{
-            parse_pointer: 0,
             parse_segment_pointer: 0,
             key_size: 0,
             val_size: 0,
@@ -114,7 +112,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 
     // things to notice: tcp data can come in at different sizes(only order is guaranteed)
     // so this parsing method tries to account for that by keeping states
-    fn parse_buff(&mut self, buff: &[u8; TCP_READ_BUFF_SIZE], op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<(), CacheDbError>{
+    pub fn parse_buff(&mut self, buff: &[u8; TCP_READ_BUFF_SIZE], op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<(), CacheDbError>{
         match self.parse_segment_pointer {
             0 => {
                 let op_code_raw: u8 = buff[0];
@@ -132,14 +130,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
             2 => {
                 let mut data = vec![0; self.key_size.into()];
                 data.copy_from_slice(&buff[3..self.key_size.into()]);
-                match KeyT::from_bytes(&data) {
-                    Ok(data_parsed) => {
-                        obj.key = data_parsed;
-                    },
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
+                obj.key = KeyT::from_bytes(&data)?;
             },
             3 => {
                 let mut size_raw: [u8; 2] = [0; 2];
@@ -149,14 +140,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
             4 => {
                 let mut data = vec![0; self.val_size.into()];
                 data.copy_from_slice(&buff[(5+self.key_size).into()..self.val_size.into()]);
-                match ValT::from_bytes(&data) {
-                    Ok(data_parsed) => {
-                        obj.val = data_parsed;
-                    },
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
+                obj.val = ValT::from_bytes(&data)?;
             },
             _ => {
             }
@@ -168,30 +152,26 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> {
     pub fn create_connect(ipv4_addr: [u8;4], port: u16) ->  Result<CacheClient<KeyT, ValT>, std::io::Error> {
         let addr = SocketAddr::from((ipv4_addr, port));
-        let tcp_stream = TcpStream::connect(addr);
-        if let Err(e) = tcp_stream {
-            return Err(e);
-        } else if let Ok(stream) = tcp_stream {
-            let cache_client = CacheClient {
-                ipv4_addr: ipv4_addr, 
-                port: port,
-                tcp_conn: stream,
-                pd_k: PhantomData,
-                pd_v: PhantomData
-            };
-            return Ok(cache_client);
-        }
-        panic!("create_connect returned neither err nor succ");
+        let tcp_stream = TcpStream::connect(addr)?;
+        let cache_client = CacheClient {
+            tcp_conn: tcp_stream,
+            pd_k: PhantomData,
+            pd_v: PhantomData
+        };
+        return Ok(cache_client);
     }
 
-    pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
-        let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PushOp, &obj);
-        println!("test: {:?}", send_buff);
+    pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) -> Result<(), CacheDbError> {
+        let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PushOp, &obj)?;
+        if let Err(_) = self.tcp_conn.write(&send_buff) {
+            return Err(CacheDbError::NetworkError);
+        }
+        Ok(())
     }
 }
 
 
-impl<KeyT: std::cmp::PartialEq, ValT> CacheDb<KeyT, ValT> {
+impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKeyVal<KeyT> + Default + Debug, ValT: GenericKeyVal<ValT> + Default + Debug {
 
     pub fn new(ipv4_addr: [u8;4], port: u16) -> CacheDb<KeyT, ValT> {
         let cache = CacheDb {
@@ -226,28 +206,29 @@ impl<KeyT: std::cmp::PartialEq, ValT> CacheDb<KeyT, ValT> {
     }
 
     fn client_handler(mut socket: TcpStream){
-        let mut buf = [0; 10];
-        socket.read(&mut buf).unwrap();
-        socket.write(&[1]).unwrap();
+        let mut buff = [0; TCP_READ_BUFF_SIZE];
+        socket.read(&mut buff).unwrap();
 
-        println!("read: {:?}", buf);
+        let mut parser = CacheProtocol::<KeyT, ValT>::new();
+
+        let mut parsed_op_code: ProtOpCode = ProtOpCode::PullOp;
+        let mut parsed_obj: KeyValObj<KeyT, ValT> = KeyValObj { key: KeyT::default(), val: ValT::default() };
+
+        parser.parse_buff(&buff, &mut parsed_op_code, &mut parsed_obj).unwrap();
+
+        println!("Key: {:?}, Val: {:?}", parsed_obj.key, parsed_obj.val);
     }
 
-    pub fn cache_db_server(&self) {
+    pub fn cache_db_server(&self) -> io::Result<()>{
         let addr = SocketAddr::from((self.ipv4_addr, self.port));
-        let listener = TcpListener::bind(addr).unwrap();
+        let listener = TcpListener::bind(addr)?;
 
         loop {
-            match listener.accept() {
-                Ok((socket, addr)) => {
-                    println!("new client: {:?}", addr);
-
-                    let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket)));
-                }
-                Err(e) => println!("couldn't get client: {:?}", e),
-            }    
+            let (socket, _addr) = listener.accept()?;
+            let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket)));
+            
             #[cfg(test)] 
-            break;
+            return Ok(());
         }
     }   
 }
@@ -260,8 +241,15 @@ mod tests {
     use super::*;
 
     impl GenericKeyVal<String> for String {
-        fn get_size(self: &String) -> usize {
-            self.chars().count()
+        fn get_size(self: &String) -> Result<u16, CacheDbError> {
+            match self.chars().count().try_into() {
+                Ok(size) => {
+                    return Ok(size);
+                },
+                Err(_) => {
+                    return Err(CacheDbError::ProtocolSizeBufferOverflow);
+                }
+            }
         }
 
         // must clone string since into_bytes() is not implemented for 
@@ -281,7 +269,7 @@ mod tests {
 
     fn basic_client_test() {
         let mut cache_client = CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
-        cache_client.push(KeyValObj{key: String::from("brian"), val: String::from("test")});
+        cache_client.push(KeyValObj{key: String::from("brian"), val: String::from("test")}).unwrap();
     }
 
     #[test]
