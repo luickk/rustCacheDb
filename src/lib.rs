@@ -16,7 +16,7 @@ pub enum CacheDbError {
     NetworkError,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum ProtOpCode {
     PullOp = 0,
     PushOp = 1,
@@ -112,40 +112,56 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 
     // things to notice: tcp data can come in at different sizes(only order is guaranteed)
     // so this parsing method tries to account for that by keeping states
-    pub fn parse_buff(&mut self, buff: &[u8; TCP_READ_BUFF_SIZE], op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<(), CacheDbError>{
-        match self.parse_segment_pointer {
-            0 => {
-                let op_code_raw: u8 = buff[0];
-                if let Some(op_code_en) = &CacheProtocol::<KeyT, ValT>::u8_to_prot_op_code(op_code_raw) {
-                    op_code.clone_from(op_code_en);
-                } else {
-                    return Err(CacheDbError::ParsingErr);
+    pub fn parse_buff(&mut self, buff: &[u8; TCP_READ_BUFF_SIZE], tcp_read_size: usize, op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<bool, CacheDbError>{
+        let mut key_valsize_raw: [u8; 2] = [0; 2];
+        let mut op_code_raw: u8;
+        loop {
+            match self.parse_segment_pointer {
+                // parsing protocol op_code
+                0 if tcp_read_size >= 1 => {
+                    op_code_raw = buff[0];
+                    if let Some(op_code_en) = &CacheProtocol::<KeyT, ValT>::u8_to_prot_op_code(op_code_raw) {
+                        op_code.clone_from(op_code_en);
+                    } else {
+                        return Err(CacheDbError::ParsingErr);
+                    }
+
+                    self.parse_segment_pointer += 1;
+                },
+                // parsing protocol key size
+                1 if tcp_read_size >= 3 => {
+                    key_valsize_raw.copy_from_slice(&buff[1..3]);
+                    self.key_size = u16::from_be_bytes(key_valsize_raw);
+
+                    self.parse_segment_pointer += 1;
+                },
+                // parsing protocol key
+                2 if tcp_read_size >= (3u16 + self.key_size).into() => {
+                    let mut data = Vec::<u8>::new();
+                    data.extend_from_slice(&buff[3..(self.key_size+3).into()]);
+                    obj.key = KeyT::from_bytes(&data)?;
+
+                    self.parse_segment_pointer += 1;
+                },
+                // parsing protocol val size
+                3 if tcp_read_size >= (5u16 + self.key_size).into() => {
+                    key_valsize_raw.copy_from_slice(&buff[(3+self.key_size).into()..(5+self.key_size).into()]);
+                    self.val_size = u16::from_be_bytes(key_valsize_raw);
+                    self.parse_segment_pointer += 1;
+                },
+                // parsing protocol val
+                4 if tcp_read_size >= (3u16 + self.key_size+ self.val_size).into() => {
+                    let mut data = Vec::<u8>::new();
+                    data.extend_from_slice(&buff[(5+self.key_size).into()..(self.val_size+5+self.key_size).into()]);
+                    obj.val = ValT::from_bytes(&data)?;
+
+                    return Ok(true);
+                },
+                _ => {
+                    return Ok(false);
                 }
-            },
-            1 => {
-                let mut size_raw: [u8; 2] = [0; 2];
-                size_raw.copy_from_slice(&buff[1..2]);
-                self.key_size = u16::from_be_bytes(size_raw);
-            },
-            2 => {
-                let mut data = vec![0; self.key_size.into()];
-                data.copy_from_slice(&buff[3..self.key_size.into()]);
-                obj.key = KeyT::from_bytes(&data)?;
-            },
-            3 => {
-                let mut size_raw: [u8; 2] = [0; 2];
-                size_raw.copy_from_slice(&buff[(3+self.key_size).into()..2]);
-                self.val_size = u16::from_be_bytes(size_raw);
-            },
-            4 => {
-                let mut data = vec![0; self.val_size.into()];
-                data.copy_from_slice(&buff[(5+self.key_size).into()..self.val_size.into()]);
-                obj.val = ValT::from_bytes(&data)?;
-            },
-            _ => {
             }
         }
-        Ok(())
     }
 }
 
@@ -205,18 +221,26 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
         Err(CacheDbError::KeyNotFound)
     }
 
-    fn client_handler(mut socket: TcpStream){
+    fn client_handler(mut socket: TcpStream) {
         let mut buff = [0; TCP_READ_BUFF_SIZE];
-        socket.read(&mut buff).unwrap();
 
         let mut parser = CacheProtocol::<KeyT, ValT>::new();
-
         let mut parsed_op_code: ProtOpCode = ProtOpCode::PullOp;
         let mut parsed_obj: KeyValObj<KeyT, ValT> = KeyValObj { key: KeyT::default(), val: ValT::default() };
+        let mut tcp_read_size: usize;
+        loop {
+            tcp_read_size = socket.read(&mut buff).unwrap();
+            if tcp_read_size == 0 {
+                continue;
+            }
+            let parsed = parser.parse_buff(&buff, tcp_read_size, &mut parsed_op_code, &mut parsed_obj).unwrap();
+            if parsed {
+                println!("OpCode: {:?} Key: {:?}, Val: {:?}", parsed_op_code, parsed_obj.key, parsed_obj.val);
 
-        parser.parse_buff(&buff, &mut parsed_op_code, &mut parsed_obj).unwrap();
-
-        println!("Key: {:?}, Val: {:?}", parsed_obj.key, parsed_obj.val);
+                #[cfg(test)]
+                break;
+            }
+        }
     }
 
     pub fn cache_db_server(&self) -> io::Result<()>{
