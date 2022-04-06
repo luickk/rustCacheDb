@@ -24,8 +24,8 @@ pub enum ProtOpCode {
 }
 
 pub struct KeyValObj<KeyT, ValT> {
-    key: KeyT,
-    val: ValT,
+    pub key: KeyT,
+    pub val: ValT,
 }
 
 pub struct CacheDb<KeyT, ValT> {
@@ -228,6 +228,7 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
         let mut parsed_op_code: ProtOpCode = ProtOpCode::PullOp;
         let mut parsed_obj: KeyValObj<KeyT, ValT> = KeyValObj { key: KeyT::default(), val: ValT::default() };
         let mut tcp_read_size: usize;
+        let mut n = 0;
         loop {
             tcp_read_size = socket.read(&mut buff).unwrap();
             if tcp_read_size == 0 {
@@ -235,7 +236,8 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
             }
             let parsed = parser.parse_buff(&buff, tcp_read_size, &mut parsed_op_code, &mut parsed_obj).unwrap();
             if parsed {
-                println!("OpCode: {:?} Key: {:?}, Val: {:?}", parsed_op_code, parsed_obj.key, parsed_obj.val);
+                n += 1;
+                println!("{:?} - OpCode: {:?} Key: {:?}, Val: {:?}", n, parsed_op_code, parsed_obj.key, parsed_obj.val);
 
                 #[cfg(test)]
                 break;
