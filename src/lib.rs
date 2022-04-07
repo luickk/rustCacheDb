@@ -37,7 +37,9 @@ pub struct CacheDb<KeyT, ValT> {
 
 pub struct CacheProtocol<KeyT, ValT> {
     // points to the segment currently read
-    parse_segment_pointer: u8,
+    parsed_protocoll_segment: u8,
+    parsed_bytes_total: usize,
+    to_parse_bytes_total: usize,
     key_size: u16,
     val_size: u16,
 
@@ -102,7 +104,9 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 
     pub fn new() -> CacheProtocol<KeyT, ValT> {
         CacheProtocol{
-            parse_segment_pointer: 0,
+            parsed_protocoll_segment: 0,
+            parsed_bytes_total: 0,
+            to_parse_bytes_total: 0,
             key_size: 0,
             val_size: 0,
             pd_k: PhantomData,
@@ -112,53 +116,71 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 
     // things to notice: tcp data can come in at different sizes(only order is guaranteed)
     // so this parsing method tries to account for that by keeping states
-    pub fn parse_buff(&mut self, buff: &[u8; TCP_READ_BUFF_SIZE], tcp_read_size: usize, op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<bool, CacheDbError>{
+    pub fn parse_buff(&mut self, buff: &[u8; TCP_READ_BUFF_SIZE], tcp_read_size: usize, op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<(bool, usize), CacheDbError>{
         let mut key_valsize_raw: [u8; 2] = [0; 2];
         let mut op_code_raw: u8;
+
         loop {
-            match self.parse_segment_pointer {
+            match self.parsed_protocoll_segment {
                 // parsing protocol op_code
-                0 if tcp_read_size >= 1 => {
+                0 if { tcp_read_size >= 1 } => {
                     op_code_raw = buff[0];
                     if let Some(op_code_en) = &CacheProtocol::<KeyT, ValT>::u8_to_prot_op_code(op_code_raw) {
                         op_code.clone_from(op_code_en);
                     } else {
                         return Err(CacheDbError::ParsingErr);
                     }
+                    self.parsed_protocoll_segment += 1;
 
-                    self.parse_segment_pointer += 1;
+                    self.parsed_bytes_total += 1;
+                    self.to_parse_bytes_total += 3;
                 },
                 // parsing protocol key size
-                1 if tcp_read_size >= 3 => {
-                    key_valsize_raw.copy_from_slice(&buff[1..3]);
+                1 if { tcp_read_size >= self.to_parse_bytes_total } => {
+                    key_valsize_raw.copy_from_slice(&buff[self.parsed_bytes_total..self.to_parse_bytes_total]);
                     self.key_size = u16::from_be_bytes(key_valsize_raw);
+                    self.parsed_protocoll_segment += 1;
 
-                    self.parse_segment_pointer += 1;
+                    self.parsed_bytes_total = self.to_parse_bytes_total;
+                    self.to_parse_bytes_total += usize::from(self.key_size);
                 },
                 // parsing protocol key
-                2 if tcp_read_size >= (3u16 + self.key_size).into() => {
+                2 if { tcp_read_size >= self.to_parse_bytes_total } => {
                     let mut data = Vec::<u8>::new();
-                    data.extend_from_slice(&buff[3..(self.key_size+3).into()]);
+                    data.extend_from_slice(&buff[self.parsed_bytes_total..self.to_parse_bytes_total]);
                     obj.key = KeyT::from_bytes(&data)?;
+                    self.parsed_protocoll_segment += 1;
 
-                    self.parse_segment_pointer += 1;
+                    self.parsed_bytes_total = self.to_parse_bytes_total;
+                    self.to_parse_bytes_total += 2 ;
                 },
                 // parsing protocol val size
-                3 if tcp_read_size >= (5u16 + self.key_size).into() => {
-                    key_valsize_raw.copy_from_slice(&buff[(3+self.key_size).into()..(5+self.key_size).into()]);
+                3 if { tcp_read_size >= self.to_parse_bytes_total } => {
+                    key_valsize_raw.copy_from_slice(&buff[self.parsed_bytes_total..self.to_parse_bytes_total]);
                     self.val_size = u16::from_be_bytes(key_valsize_raw);
-                    self.parse_segment_pointer += 1;
+                    self.parsed_protocoll_segment += 1;
+
+                    self.parsed_bytes_total = self.to_parse_bytes_total;
+                    self.to_parse_bytes_total += usize::from(self.val_size);
                 },
                 // parsing protocol val
-                4 if tcp_read_size >= (3u16 + self.key_size+ self.val_size).into() => {
+                4 if { tcp_read_size >= self.to_parse_bytes_total } => {
                     let mut data = Vec::<u8>::new();
-                    data.extend_from_slice(&buff[(5+self.key_size).into()..(self.val_size+5+self.key_size).into()]);
+                    data.extend_from_slice(&buff[self.parsed_bytes_total..self.to_parse_bytes_total]);
                     obj.val = ValT::from_bytes(&data)?;
 
-                    return Ok(true);
+                    // using self.to_parse_bytes_total because next matching arm (this one) has been parsed
+                    let left_over = tcp_read_size-self.to_parse_bytes_total;
+
+                    self.parsed_protocoll_segment = 0;
+                    self.parsed_bytes_total = 0;
+                    self.to_parse_bytes_total = 0;
+                    return Ok((true, left_over));
                 },
                 _ => {
-                    return Ok(false);
+                    // using self.parsed_bytes_total because thats last matching expression and self.to_parse_bytes_total isn't parsed anymore
+                    let left_over = tcp_read_size-self.parsed_bytes_total;
+                    return Ok((false, left_over));
                 }
             }
         }
@@ -234,14 +256,18 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
             if tcp_read_size == 0 {
                 continue;
             }
-            let parsed = parser.parse_buff(&buff, tcp_read_size, &mut parsed_op_code, &mut parsed_obj).unwrap();
-            if parsed {
-                n += 1;
-                println!("{:?} - OpCode: {:?} Key: {:?}, Val: {:?}", n, parsed_op_code, parsed_obj.key, parsed_obj.val);
-
-                #[cfg(test)]
-                break;
+            loop {
+                let (parsed, left_over) = parser.parse_buff(&buff, tcp_read_size, &mut parsed_op_code, &mut parsed_obj).unwrap();
+                if left_over != 0 && !parsed {
+                    break;
+                } else if parsed {
+                    n += 1;
+                    println!("{:?} - OpCode: {:?} Key: {:?}, Val: {:?}", n, parsed_op_code, parsed_obj.key, parsed_obj.val);
+                    continue;
+                }
             }
+            #[cfg(test)]
+            break;
         }
     }
 
