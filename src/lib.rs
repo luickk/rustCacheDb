@@ -18,9 +18,10 @@ pub enum CacheDbError {
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum ProtOpCode {
-    PullOp = 0,
-    PushOp = 1,
-    PullReplyOp = 2,
+    PullOp = 1,
+    PushOp = 2,
+    PullReplyOp = 3,
+    TerminateConn = 4,
 }
 
 pub struct KeyValObj<KeyT, ValT> {
@@ -63,24 +64,23 @@ pub trait GenericKeyVal<Val> {
 impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> + Debug {
     fn prot_op_code_to_u8(op_code: &ProtOpCode) -> u8 {
         match op_code {
-            ProtOpCode::PushOp => 2,
             ProtOpCode::PullOp => 1,
+            ProtOpCode::PushOp => 2,
             ProtOpCode::PullReplyOp => 3,
+            ProtOpCode::TerminateConn => 4,
         }
     }
     fn u8_to_prot_op_code(op_code: u8) -> Option<ProtOpCode> {
         match op_code {
-            2 => Some(ProtOpCode::PushOp),
             1 => Some(ProtOpCode::PullOp),
+            2 => Some(ProtOpCode::PushOp),
             3 => Some(ProtOpCode::PullReplyOp),
+            4 => Some(ProtOpCode::TerminateConn),
             _ => None,
         }
     }
 
-    pub fn assemble_buff(
-        op_code: ProtOpCode,
-        obj: &KeyValObj<KeyT, ValT>,
-    ) -> Result<Vec<u8>, CacheDbError> {
+    pub fn assemble_buff(op_code: ProtOpCode, obj: &KeyValObj<KeyT, ValT>) -> Result<Vec<u8>, CacheDbError> {
         let mut buff = Vec::<u8>::new();
         buff.push(CacheProtocol::<KeyT, ValT>::prot_op_code_to_u8(&op_code));
 
@@ -148,7 +148,9 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
                 }
                 // parsing protocol key
                 2 if { tcp_read_size >= self.to_parse_bytes_total } => {
-                    obj.key = KeyT::from_bytes(&buff[self.parsed_bytes_total..self.to_parse_bytes_total])?;
+                    if self.key_size != 0 {
+                        obj.key = KeyT::from_bytes(&buff[self.parsed_bytes_total..self.to_parse_bytes_total])?;
+                    }
                     self.parsed_protocoll_segment += 1;
 
                     self.parsed_bytes_total = self.to_parse_bytes_total;
@@ -165,8 +167,9 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
                 }
                 // parsing protocol val
                 4 if { tcp_read_size >= self.to_parse_bytes_total } => {
-                    obj.val = ValT::from_bytes(&buff[self.parsed_bytes_total..self.to_parse_bytes_total])?;
-
+                    if self.val_size != 0 {
+                        obj.val = ValT::from_bytes(&buff[self.parsed_bytes_total..self.to_parse_bytes_total])?;
+                    }
                     self.parsed_protocoll_segment = 0;
                     self.parsed_bytes_total = self.to_parse_bytes_total;
 
@@ -194,10 +197,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 }
 
 impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> + Debug {
-    pub fn create_connect(
-        ipv4_addr: [u8; 4],
-        port: u16,
-    ) -> Result<CacheClient<KeyT, ValT>, std::io::Error> {
+    pub fn create_connect(ipv4_addr: [u8; 4], port: u16) -> Result<CacheClient<KeyT, ValT>, std::io::Error> {
         let addr = SocketAddr::from((ipv4_addr, port));
         let tcp_stream = TcpStream::connect(addr)?;
         let cache_client = CacheClient {
@@ -215,6 +215,13 @@ impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: 
         }
         Ok(())
     }
+
+    pub fn terminate_conn(&mut self) -> io::Result<usize> {
+        // op_code 4 -> terminate_conn
+        // key/val size 0/ 0
+        let term_seq: [u8; 5] = [4, 0, 0 ,0 ,0];
+        self.tcp_conn.write(&term_seq)
+    }
 }
 
 impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKeyVal<KeyT> + Default + Debug, ValT: GenericKeyVal<ValT> + Default + Debug {
@@ -228,14 +235,23 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
     }
 
     pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
-        self.key_val_store
-            .push(Box::<KeyValObj<KeyT, ValT>>::new(obj));
+        self.key_val_store.push(Box::<KeyValObj<KeyT, ValT>>::new(obj));
     }
 
-    pub fn get(&self, key: KeyT) -> Option<&KeyValObj<KeyT, ValT>> {
+    // returning reference since there is a lifetime from the CacheDb(self) struct
+    pub fn get(&self, key: &KeyT) -> Option<&Box<KeyValObj<KeyT, ValT>>> {
         for obj in self.key_val_store.iter() {
-            if obj.key == key {
-                return Some(&obj);
+            if &obj.key == key {
+                return Some(obj);
+            }
+        }
+        None
+    }
+
+    pub fn get_from_store(key_val_store: &Vec<Box<KeyValObj<KeyT, ValT>>>, key: &KeyT) -> Option<KeyValObj<KeyT, ValT>> {
+        for obj in key_val_store.iter() {
+            if &obj.key == key {
+                return Some(**obj.clone());
             }
         }
         None
@@ -251,7 +267,7 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
         Err(CacheDbError::KeyNotFound)
     }
 
-    fn client_handler(mut socket: TcpStream) {
+    fn client_handler(mut socket: TcpStream, ) {
         let mut buff = [0; TCP_READ_BUFF_SIZE];
 
         let mut parser = CacheProtocol::<KeyT, ValT>::new();
@@ -261,49 +277,67 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
             val: ValT::default(),
         };
         let mut tcp_read_size: usize;
-        let mut n = 0;
         let mut buff_left_over_size: usize = 0;
-        loop {
-            println!("1: {:?}", buff);
+        'tcp_read: loop {
             if buff_left_over_size == 0 {
                 tcp_read_size = socket.read(&mut buff).unwrap();
 
             } else {
                 tcp_read_size = socket.read(&mut buff[buff_left_over_size..]).unwrap();
             }
-            tcp_read_size += buff_left_over_size;
             
-            println!("2: {:?}", buff);
-
-            if buff_left_over_size == 0 {
-                parser.parsed_bytes_total = 0;
-                parser.to_parse_bytes_total = 0;
-            } else {
-                parser.parsed_bytes_total = 0;
-                parser.to_parse_bytes_total = 0;
-
-                match parser.parsed_protocoll_segment {
-                    0 => { parser.to_parse_bytes_total = 1; },
-                    1 => { parser.to_parse_bytes_total = 2; },
-                    2 => { parser.to_parse_bytes_total = parser.key_size as usize; },
-                    3 => { parser.to_parse_bytes_total = 2; },
-                    4 => { parser.to_parse_bytes_total = parser.val_size as usize; },
-                    _ => {},
-                }
-            }
-
             if tcp_read_size == 0 {
                 continue;
             }
+
+            tcp_read_size += buff_left_over_size;
+            
+            // reset buffer parsing pointer only if there is no left over buffer and 
+            // if the parsing is completed
+            if buff_left_over_size == 0 && parser.parsed_protocoll_segment == 0 {
+                parser.parsed_bytes_total = 0;
+                parser.to_parse_bytes_total = 0;
+            } else {
+                // set to_parse_bytes_total to absolute size
+                parser.to_parse_bytes_total = parser.to_parse_bytes_total - parser.parsed_bytes_total;
+                parser.parsed_bytes_total = 0;
+            }
+
             loop {
                 match parser.parse_buff(&mut buff, tcp_read_size, &mut parsed_op_code, &mut parsed_obj).unwrap() {
+                    // check wether parse_buff is done(-> can't parse the buffer any further without next tcp buff read)
                     (parsed, left_over_size) if !parsed => {
                         buff_left_over_size = left_over_size;
                         break;
                     },
                     (parsed, _) if parsed => {
-                        n += 1;
-                        println!("{:?} - OpCode: {:?} Key: {:?}, Val: {:?}", n, parsed_op_code, parsed_obj.key, parsed_obj.val);
+                        // successfully parsed parsed_obj is now updated to latest parsed obj (such as parsed_op_code)
+                        println!("OpCode: {:?} Key: {:?}, Val: {:?}", parsed_op_code, parsed_obj.key, parsed_obj.val);
+                        match parsed_op_code {
+                            ProtOpCode::TerminateConn => {
+                                break 'tcp_read;
+                            },
+                            ProtOpCode::PushOp => {
+                                todo!("implement push op");
+                            }
+                            ProtOpCode::PullOp => {
+                                if let Some(obj) = CacheDb::<KeyT, ValT>::get_from_store(&parsed_obj.key) {
+                                    match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &obj) {
+                                        Ok(send_buff) => {
+                                            if let Err(_) = socket.write(&send_buff) {
+                                                break 'tcp_read;
+                                            }       
+                                        },
+                                        Err(_) => {
+                                            break 'tcp_read;
+                                        }
+                                    }
+                                }
+                            },
+                            _ => {
+                                break 'tcp_read;
+                            }
+                        }
                         continue;
                     },
                     (_, _) => {
@@ -320,7 +354,7 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
 
         loop {
             let (socket, _addr) = listener.accept()?;
-            let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket)));
+            let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket, )));
 
             #[cfg(test)]
             return Ok(());

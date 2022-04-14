@@ -44,15 +44,17 @@ fn extended_client_test() {
         };
         cache_client.push(co).unwrap();
     }
+    cache_client.terminate_conn().unwrap();
 }
 
 #[test]
 fn extended_server_test() {
     let cache = rustcachedb::CacheDb::<CacheString, CacheString>::new([127, 0, 0, 1], 8081);
-    let test_server_instance = thread::spawn(move || (cache.cache_db_server()));
+
+    let _test_server_instance = thread::spawn(move || (cache.cache_db_server()));
     thread::sleep(time::Duration::from_secs(1));
     extended_client_test();
-    if let Err(e) = test_server_instance.join() {
-        panic!("{:?}", e);
-    }
+    // if let Err(e) = test_server_instance.join() {
+    //     panic!("{:?}", e);
+    // }
 }
