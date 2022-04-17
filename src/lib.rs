@@ -4,8 +4,11 @@ use std::io::prelude::*;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
+use std::sync::{Arc, RwLock};
 
 const TCP_READ_BUFF_SIZE: usize = 1024;
+
+// type CacheDb<KeyT, ValT> = Arc<RwLock<CacheDb<KeyT, ValT>>>;
 
 #[derive(Debug)]
 pub enum CacheDbError {
@@ -24,6 +27,7 @@ pub enum ProtOpCode {
     TerminateConn = 4,
 }
 
+#[derive(Clone, Copy)]
 pub struct KeyValObj<KeyT, ValT> {
     pub key: KeyT,
     pub val: ValT,
@@ -224,7 +228,7 @@ impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: 
     }
 }
 
-impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKeyVal<KeyT> + Default + Debug, ValT: GenericKeyVal<ValT> + Default + Debug {
+impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKeyVal<KeyT> + Default + Debug + std::marker::Send + std::marker::Sync, ValT: GenericKeyVal<ValT> + Default + Debug + std::marker::Send + std::marker::Sync, KeyValObj<KeyT, ValT>: Clone {
     pub fn new(ipv4_addr: [u8; 4], port: u16) -> CacheDb<KeyT, ValT> {
         let cache = CacheDb {
             ipv4_addr: ipv4_addr,
@@ -236,22 +240,14 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
 
     pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
         self.key_val_store.push(Box::<KeyValObj<KeyT, ValT>>::new(obj));
+
     }
 
     // returning reference since there is a lifetime from the CacheDb(self) struct
-    pub fn get(&self, key: &KeyT) -> Option<&Box<KeyValObj<KeyT, ValT>>> {
+    pub fn get(&self, key: &KeyT) -> Option<Box<KeyValObj<KeyT, ValT>>> {
         for obj in self.key_val_store.iter() {
             if &obj.key == key {
-                return Some(obj);
-            }
-        }
-        None
-    }
-
-    pub fn get_from_store(key_val_store: &Vec<Box<KeyValObj<KeyT, ValT>>>, key: &KeyT) -> Option<KeyValObj<KeyT, ValT>> {
-        for obj in key_val_store.iter() {
-            if &obj.key == key {
-                return Some(**obj.clone());
+                return Some((*obj).clone());
             }
         }
         None
@@ -267,7 +263,7 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
         Err(CacheDbError::KeyNotFound)
     }
 
-    fn client_handler(mut socket: TcpStream, ) {
+    fn client_handler(mut socket: TcpStream, cache: Arc<RwLock<CacheDb<KeyT, ValT>>>) {
         let mut buff = [0; TCP_READ_BUFF_SIZE];
 
         let mut parser = CacheProtocol::<KeyT, ValT>::new();
@@ -321,7 +317,8 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
                                 todo!("implement push op");
                             }
                             ProtOpCode::PullOp => {
-                                if let Some(obj) = CacheDb::<KeyT, ValT>::get_from_store(&parsed_obj.key) {
+
+                                if let Some(obj) = cache.write().unwrap().get(&parsed_obj.key) {
                                     match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &obj) {
                                         Ok(send_buff) => {
                                             if let Err(_) = socket.write(&send_buff) {
@@ -348,13 +345,15 @@ impl<KeyT, ValT> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKe
         }
     }
 
-    pub fn cache_db_server(&self) -> io::Result<()> {
-        let addr = SocketAddr::from((self.ipv4_addr, self.port));
-        let listener = TcpListener::bind(addr)?;
+    pub fn cache_db_server(cache: Arc<RwLock<CacheDb<KeyT, ValT>>>) -> io::Result<()> {
+        let cache_read = cache.read().unwrap();
+        let addr = SocketAddr::from((cache_read.ipv4_addr, cache_read.port));
 
+        let listener = TcpListener::bind(addr)?;
         loop {
             let (socket, _addr) = listener.accept()?;
-            let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket, )));
+            let thread_cache = Arc::clone(&cache);
+            let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket, thread_cache)));
 
             #[cfg(test)]
             return Ok(());

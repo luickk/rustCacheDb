@@ -2,6 +2,7 @@ extern crate rustcachedb;
 
 use std::thread;
 use std::time;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Default, Debug, PartialEq)]
 struct CacheString(String);
@@ -49,9 +50,10 @@ fn extended_client_test() {
 
 #[test]
 fn extended_server_test() {
-    let cache = rustcachedb::CacheDb::<CacheString, CacheString>::new([127, 0, 0, 1], 8081);
+    let cache = Arc::new(RwLock::new(rustcachedb::CacheDb::<CacheString, CacheString>::new([127, 0, 0, 1], 8081)));
 
-    let _test_server_instance = thread::spawn(move || (cache.cache_db_server()));
+    let _test_server_instance = thread::spawn(move || (rustcachedb::CacheDb::<CacheString, CacheString>::cache_db_server(cache)));
+    
     thread::sleep(time::Duration::from_secs(1));
     extended_client_test();
     // if let Err(e) = test_server_instance.join() {
