@@ -8,8 +8,6 @@ use std::sync::{Arc, RwLock};
 
 const TCP_READ_BUFF_SIZE: usize = 1024;
 
-// type CacheDb<KeyT, ValT> = Arc<RwLock<CacheDb<KeyT, ValT>>>;
-
 #[derive(Debug)]
 pub enum CacheDbError {
     KeyNotFound,
@@ -118,7 +116,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
         }
     }
 
-    // things to notice: tcp data can come in at different sizes(only order is guaranteed)
+    // things to notice: tcp data can come in at different sizes(only order is guaranteed - FIFO)
     // so this parsing method tries to account for that by keeping states
     pub fn parse_buff(&mut self, buff: &mut [u8; TCP_READ_BUFF_SIZE], tcp_read_size: usize, op_code: &mut ProtOpCode, obj: &mut KeyValObj<KeyT, ValT>) -> Result<(bool, usize), CacheDbError> {
         let mut key_valsize_raw: [u8; 2] = [0; 2];
@@ -229,13 +227,13 @@ impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: 
 }
 
 impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKeyVal<KeyT> + Default + Debug + std::marker::Send + std::marker::Sync, ValT: GenericKeyVal<ValT> + Default + Debug + std::marker::Send + std::marker::Sync, KeyValObj<KeyT, ValT>: Clone {
-    pub fn new(ipv4_addr: [u8; 4], port: u16) -> CacheDb<KeyT, ValT> {
+    pub fn new(ipv4_addr: [u8; 4], port: u16) -> Arc<RwLock<CacheDb<KeyT, ValT>>> {
         let cache = CacheDb {
             ipv4_addr: ipv4_addr,
             port: port,
             key_val_store: Vec::new(),
         };
-        cache
+        Arc::new(RwLock::new(cache))
     }
 
     pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
@@ -314,11 +312,10 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::Par
                                 break 'tcp_read;
                             },
                             ProtOpCode::PushOp => {
-                                todo!("implement push op");
+                                cache.write().unwrap().push(parsed_obj.clone());
                             }
                             ProtOpCode::PullOp => {
-
-                                if let Some(obj) = cache.write().unwrap().get(&parsed_obj.key) {
+                                if let Some(obj) = cache.read().unwrap().get(&parsed_obj.key) {
                                     match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &obj) {
                                         Ok(send_buff) => {
                                             if let Err(_) = socket.write(&send_buff) {
@@ -397,62 +394,69 @@ mod tests {
     fn basic_client_test() {
         let mut cache_client =
             CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
-        cache_client
-            .push(KeyValObj {
+            cache_client.push(KeyValObj {
                 key: String::from("brian"),
                 val: String::from("test"),
-            })
-            .unwrap();
+            }).unwrap();
     }
 
     #[test]
     fn basic_server_test() {
         let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
-        let _test_server_instance = thread::spawn(move || (cache.cache_db_server()));
+        // as we defined the traits here we can implement them for String and don't need a wrapper
+        let _test_server_instance = thread::spawn(move || (CacheDb::<String, String>::cache_db_server(cache)));
         thread::sleep(time::Duration::from_secs(1));
         basic_client_test();
     }
 
     #[test]
     fn local_cache_db_test() {
-        let mut cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
+        let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
 
-        cache.push(KeyValObj {
+        cache.write().unwrap().push(KeyValObj {
             key: String::from("brian"),
             val: String::from("test"),
         });
-        cache.push(KeyValObj {
+        cache.write().unwrap().push(KeyValObj {
             key: String::from("paul"),
-            val: String::from("test"),
+            val: String::from("test1"),
         });
-        cache.push(KeyValObj {
+        cache.write().unwrap().push(KeyValObj {
             key: String::from("pete"),
-            val: String::from("test"),
+            val: String::from("test2"),
         });
-        cache.push(KeyValObj {
+        cache.write().unwrap().push(KeyValObj {
             key: String::from("robert"),
-            val: String::from("test"),
+            val: String::from("test3"),
         });
 
-        let get_res = cache.get(String::from("brian")).unwrap();
-        println!("get k: {} v: {}", get_res.key, get_res.val);
-        let get_res = cache.get(String::from("paul")).unwrap();
-        println!("get k: {} v: {}", get_res.key, get_res.val);
-        let get_res = cache.get(String::from("pete")).unwrap();
-        println!("get k: {} v: {}", get_res.key, get_res.val);
-        let get_res = cache.get(String::from("robert")).unwrap();
+        let get_res = cache.read().unwrap().get(&String::from("brian")).unwrap();
+        assert_eq!(&get_res.val, "test");
         println!("get k: {} v: {}", get_res.key, get_res.val);
 
-        if let None = cache.get(String::from("ian")) {
+        let get_res = cache.read().unwrap().get(&String::from("paul")).unwrap();
+        assert_eq!(&get_res.val, "test1");
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+
+        let get_res = cache.read().unwrap().get(&String::from("pete")).unwrap();
+        assert_eq!(&get_res.val, "test2");
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+
+        let get_res = cache.read().unwrap().get(&String::from("robert")).unwrap();
+        assert_eq!(&get_res.val, "test3");
+        println!("get k: {} v: {}", get_res.key, get_res.val);
+
+        if let None = cache.read().unwrap().get(&String::from("ian")) {
             println!("Ian not found!");
         } else {
-            panic!("local get() test failed");
+            assert!(true);
         }
 
-        if let Err(_e) = cache.set(String::from("robert"), String::from("mod_test")) {
-            panic!("set test failed");
+        if let Err(_e) = cache.write().unwrap().set(String::from("robert"), String::from("mod_test")) {
+            assert!(true);
         }
-        let get_res = cache.get(String::from("robert")).unwrap();
+        let get_res = cache.read().unwrap().get(&String::from("robert")).unwrap();
+        assert_eq!(&get_res.val, "mod_test");
         println!("mod get k: {} v: {}", get_res.key, get_res.val);
     }
 }
