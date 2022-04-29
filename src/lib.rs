@@ -2,9 +2,12 @@ use std::fmt::Debug;
 use std::io;
 use std::io::prelude::*;
 use std::marker::PhantomData;
-use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
-use std::sync::{Arc, RwLock};
+use std::thread::JoinHandle;
+use std::cmp::PartialEq;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, RwLock, Mutex, Condvar};
+use std::marker::{Send, Sync};
 
 const TCP_READ_BUFF_SIZE: usize = 1024;
 
@@ -31,6 +34,15 @@ pub struct KeyValObj<KeyT, ValT> {
     pub val: ValT,
 }
 
+pub struct KeyValObjSync<KeyT, ValT> {
+    // only true if data is currently requested (pulled)
+    pub pulling: Mutex<bool>,
+    pub pulling_sig: Condvar,
+
+    pub key_pulled: KeyT,
+    pub val_received: ValT,
+}
+
 pub struct CacheDb<KeyT, ValT> {
     ipv4_addr: [u8; 4],
     port: u16,
@@ -46,13 +58,16 @@ pub struct CacheProtocol<KeyT, ValT> {
     key_size: u16,
     val_size: u16,
 
+    // because of unconstrained type conflict
     pd_k: PhantomData<KeyT>,
     pd_v: PhantomData<ValT>,
 }
 
 pub struct CacheClient<KeyT, ValT> {
+    key_val_sync_store: Vec<KeyValObjSync<KeyT, ValT>>,
     tcp_conn: TcpStream,
 
+    // because of unconstrained type conflict
     pd_k: PhantomData<KeyT>,
     pd_v: PhantomData<ValT>,
 }
@@ -85,7 +100,6 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
     pub fn assemble_buff(op_code: ProtOpCode, obj: &KeyValObj<KeyT, ValT>) -> Result<Vec<u8>, CacheDbError> {
         let mut buff = Vec::<u8>::new();
         buff.push(CacheProtocol::<KeyT, ValT>::prot_op_code_to_u8(&op_code));
-
         let key_size = obj.key.get_size()?.to_be_bytes();
         buff.extend_from_slice(&key_size);
         let mut key_bytes = obj.key.get_bytes();
@@ -198,16 +212,18 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
     }
 }
 
-impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> + Debug {
-    pub fn create_connect(ipv4_addr: [u8; 4], port: u16) -> Result<CacheClient<KeyT, ValT>, std::io::Error> {
+impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT> + Clone + PartialEq + Default + Debug + Send + Sync, ValT: GenericKeyVal<ValT> + Clone + Debug + Default + Send + Sync {
+
+    pub fn create_connect(ipv4_addr: [u8; 4], port: u16) -> Result<Arc<RwLock<CacheClient<KeyT, ValT>>>, std::io::Error> {
         let addr = SocketAddr::from((ipv4_addr, port));
         let tcp_stream = TcpStream::connect(addr)?;
-        let cache_client = CacheClient {
+        Ok(Arc::new(RwLock::new(CacheClient {
             tcp_conn: tcp_stream,
+            key_val_sync_store: Vec::new(),
+
             pd_k: PhantomData,
-            pd_v: PhantomData,
-        };
-        return Ok(cache_client);
+            pd_v: PhantomData
+        })))
     }
 
     pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) -> Result<(), CacheDbError> {
@@ -218,15 +234,133 @@ impl<KeyT, ValT> CacheClient<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: 
         Ok(())
     }
 
+    pub fn pull(&mut self, key: &KeyT) -> Result<KeyValObj<KeyT, ValT>, CacheDbError> {
+        for obj in self.key_val_sync_store.iter() {
+            if obj.key_pulled == *key {
+                let mut _pull_sig_lock = obj.pulling.lock().unwrap();
+
+                // if it is not yet requesting val; we do so
+                // if is was already requested(obj.pulling = true) by somebody else we don't need to repeat
+                if !*_pull_sig_lock {
+                    // todo => mem optimization
+                    let pull_obj = KeyValObj{key: (*key).clone(), val: ValT::default()};
+                    let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &pull_obj)?;
+                    if let Err(_) = self.tcp_conn.write(&send_buff) {
+                        return Err(CacheDbError::NetworkError);
+                    }
+
+                    // is set back to negative by the CacheClientHandler on request reply
+                    *_pull_sig_lock = true;
+                    obj.pulling_sig.notify_one();
+                }
+
+                // waiting for pulling to turn to false
+                // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
+                // 2. if it was true (obj.pulling), it has been true already which indicates that tere has been a request made by somebody else
+                while !*_pull_sig_lock {
+                    _pull_sig_lock = obj.pulling_sig.wait(_pull_sig_lock).unwrap();
+                    // obj.pulling has been set to false by the CacheClientHandler(todo) and can now be read from the key_val_sync_store
+                    return Ok(KeyValObj{key: obj.key_pulled.clone(), val: obj.val_received.clone()});
+                }
+            }
+        }
+        Err(CacheDbError::KeyNotFound)
+    }
+
     pub fn terminate_conn(&mut self) -> io::Result<usize> {
         // op_code 4 -> terminate_conn
         // key/val size 0/ 0
         let term_seq: [u8; 5] = [4, 0, 0 ,0 ,0];
         self.tcp_conn.write(&term_seq)
     }
+
+    pub fn cache_client_handler(cache_client: &Arc<RwLock<CacheClient<KeyT, ValT>>>) -> JoinHandle<Result<(), CacheDbError>> {
+        let ccache_clone = Arc::clone(cache_client);
+        thread::spawn(move || {
+            let mut buff = [0; TCP_READ_BUFF_SIZE];
+
+            let mut parser = CacheProtocol::<KeyT, ValT>::new();
+            let mut parsed_op_code: ProtOpCode = ProtOpCode::PullOp;
+            let mut parsed_obj: KeyValObj<KeyT, ValT> = KeyValObj {
+                key: KeyT::default(),
+                val: ValT::default(),
+            };
+            let mut tcp_read_size: usize;
+            let mut buff_left_over_size: usize = 0;
+            'tcp_read: loop {
+                if buff_left_over_size == 0 {
+                    match ccache_clone.write().unwrap().tcp_conn.read(&mut buff) {
+                        Err(_) => return Err(CacheDbError::NetworkError),
+                        Ok(size) => tcp_read_size = size
+                    }
+                } else {
+                    match ccache_clone.write().unwrap().tcp_conn.read(&mut buff[buff_left_over_size..]) {
+                        Err(_) => return Err(CacheDbError::NetworkError),
+                        Ok(size) => tcp_read_size = size
+                    }
+                }
+                
+                if tcp_read_size == 0 {
+                    continue;
+                }
+
+                tcp_read_size += buff_left_over_size;
+                
+                // reset buffer parsing pointer only if there is no left over buffer and 
+                // if the parsing is completed
+                if buff_left_over_size == 0 && parser.parsed_protocoll_segment == 0 {
+                    parser.parsed_bytes_total = 0;
+                    parser.to_parse_bytes_total = 0;
+                } else {
+                    // set to_parse_bytes_total to absolute size
+                    parser.to_parse_bytes_total = parser.to_parse_bytes_total - parser.parsed_bytes_total;
+                    parser.parsed_bytes_total = 0;
+                }
+
+                loop {
+                    match parser.parse_buff(&mut buff, tcp_read_size, &mut parsed_op_code, &mut parsed_obj)? {
+                        // check wether parse_buff is done(-> can't parse the buffer any further without next tcp buff read)
+                        (parsed, left_over_size) if !parsed => {
+                            buff_left_over_size = left_over_size;
+                            break;
+                        },
+                        (parsed, _) if parsed => {
+                            // successfully parsed parsed_obj is now updated to latest parsed obj (such as parsed_op_code)
+                            println!("Client handler OpCode: {:?} Key: {:?}, Val: {:?}", parsed_op_code, parsed_obj.key, parsed_obj.val);
+                            match parsed_op_code {
+                                ProtOpCode::TerminateConn => {
+                                    break 'tcp_read;
+                                },
+                                ProtOpCode::PullReplyOp => {
+                                    for mut obj in ccache_clone.write().unwrap().key_val_sync_store.iter_mut() {
+                                        if obj.key_pulled == parsed_obj.key {
+                                            obj.val_received = parsed_obj.val.clone();
+                                            *obj.pulling.lock().unwrap() = false;
+                                            obj.pulling_sig.notify_one();
+                                            println!("updated");
+                                        } else {
+                                            ccache_clone.write().unwrap().key_val_sync_store.push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_pulled:parsed_obj.key.clone(), val_received: parsed_obj.val.clone()});
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    break 'tcp_read;
+                                }
+                            }
+                            continue;
+                        },
+                        (_, _) => {
+                            break;
+                        }
+                    }
+                }
+            }
+            return Ok(())
+        })
+    }
 }
 
-impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::PartialEq + GenericKeyVal<KeyT> + Default + Debug + std::marker::Send + std::marker::Sync, ValT: GenericKeyVal<ValT> + Default + Debug + std::marker::Send + std::marker::Sync, KeyValObj<KeyT, ValT>: Clone {
+impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + GenericKeyVal<KeyT> + Default + Debug + Send + Sync, ValT: GenericKeyVal<ValT> + Default + Debug + Send + Sync, KeyValObj<KeyT, ValT>: Clone {
     pub fn new(ipv4_addr: [u8; 4], port: u16) -> Arc<RwLock<CacheDb<KeyT, ValT>>> {
         let cache = CacheDb {
             ipv4_addr: ipv4_addr,
@@ -242,10 +376,10 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::Par
     }
 
     // returning reference since there is a lifetime from the CacheDb(self) struct
-    pub fn get(&self, key: &KeyT) -> Option<Box<KeyValObj<KeyT, ValT>>> {
+    pub fn get(&self, key: &KeyT) -> Option<KeyValObj<KeyT, ValT>> {
         for obj in self.key_val_store.iter() {
             if &obj.key == key {
-                return Some((*obj).clone());
+                return Some((**obj).clone());
             }
         }
         None
@@ -261,7 +395,7 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::Par
         Err(CacheDbError::KeyNotFound)
     }
 
-    fn client_handler(mut socket: TcpStream, cache: Arc<RwLock<CacheDb<KeyT, ValT>>>) {
+    fn client_handler(mut socket: TcpStream, cache: &Arc<RwLock<CacheDb<KeyT, ValT>>>) {
         let mut buff = [0; TCP_READ_BUFF_SIZE];
 
         let mut parser = CacheProtocol::<KeyT, ValT>::new();
@@ -342,19 +476,23 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: std::cmp::Par
         }
     }
 
-    pub fn cache_db_server(cache: Arc<RwLock<CacheDb<KeyT, ValT>>>) -> io::Result<()> {
-        let cache_read = cache.read().unwrap();
-        let addr = SocketAddr::from((cache_read.ipv4_addr, cache_read.port));
+    pub fn cache_db_server(cache: &Arc<RwLock<CacheDb<KeyT, ValT>>>) -> JoinHandle<io::Result<()>> {
+        let cache_clone = Arc::clone(cache);
 
-        let listener = TcpListener::bind(addr)?;
-        loop {
-            let (socket, _addr) = listener.accept()?;
-            let thread_cache = Arc::clone(&cache);
-            let _handler = thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket, thread_cache)));
+        thread::spawn(move || {
+            let cache_read = cache_clone.read().unwrap();
+            let addr = SocketAddr::from((cache_read.ipv4_addr, cache_read.port));
 
-            #[cfg(test)]
-            return Ok(());
-        }
+            let listener = TcpListener::bind(addr)?;
+            loop {
+                let (socket, _addr) = listener.accept()?;
+                let thread_cache = Arc::clone(&cache_clone);
+                thread::spawn(move || (CacheDb::<KeyT, ValT>::client_handler(socket, &thread_cache)));
+
+                #[cfg(test)]
+                return Ok(());
+            }
+        })
     }
 }
 
@@ -392,19 +530,18 @@ mod tests {
     }
 
     fn basic_client_test() {
-        let mut cache_client =
-            CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
-            cache_client.push(KeyValObj {
-                key: String::from("brian"),
-                val: String::from("test"),
-            }).unwrap();
+        let cache_client = CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
+        CacheClient::<String, String>::cache_client_handler(&cache_client);
+        // .join().unwrap();
     }
 
     #[test]
     fn basic_server_test() {
         let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
-        // as we defined the traits here we can implement them for String and don't need a wrapper
-        let _test_server_instance = thread::spawn(move || (CacheDb::<String, String>::cache_db_server(cache)));
+        CacheDb::<String, String>::cache_db_server(&cache);
+        // .join().unwrap();
+
+        cache.write().unwrap().push(KeyValObj{key: "asd".to_string(), val: "das".to_string()});
         thread::sleep(time::Duration::from_secs(1));
         basic_client_test();
     }
