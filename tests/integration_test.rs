@@ -36,7 +36,7 @@ impl rustcachedb::GenericKeyVal<CacheString> for CacheString {
 
 fn extended_client_test() {
     let cache_client = CacheClient::<CacheString, CacheString>::create_connect([127, 0, 0, 1], 8081).unwrap();
-    let s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
+    // let s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
         // .join().unwrap();
     // let mut cc_write = cache_client.write().unwrap();
     for i in 1..10 {
@@ -45,19 +45,20 @@ fn extended_client_test() {
             val: CacheString(String::from(format!("val{}", i))),
         };
         println!("int test pushing {:?}", i);
-        cache_client.write().unwrap().push(co).unwrap();
+        cache_client.push(co).unwrap();
     }
-
+    
     let mut pull_k: CacheString;
     let mut pull_v: String;
     for i in 1..10 {
+        println!("1pull");
         pull_k = CacheString(String::from(format!("key{}", i)));
         pull_v = String::from(format!("val{}", i));
-        let get_res = cache_client.write().unwrap().pull(&pull_k).unwrap();
+        let get_res = cache_client.pull(&pull_k).unwrap();
         assert_eq!(get_res.val.0, pull_v);
     }
     println!("done");
-    // s.join();
+    // s.join().unwrap();
 }
 
 #[test]
@@ -69,7 +70,7 @@ fn extended_server_test() {
         val: CacheString(String::from("test")),
     });
 
-    let cache_db_server = CacheDb::<CacheString, CacheString>::cache_db_server(&cache);
+    let _cache_db_server = CacheDb::<CacheString, CacheString>::cache_db_server(&cache);
         // .join().unwrap();
         
     thread::sleep(time::Duration::from_secs(1));
