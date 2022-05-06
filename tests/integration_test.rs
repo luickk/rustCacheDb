@@ -32,40 +32,45 @@ impl rustcachedb::GenericKeyVal<CacheString> for CacheString {
         }
         Err(CacheDbError::DecodingErr)
     }
+
+    fn empty() -> CacheString {
+        CacheString("".to_string())
+    }
 }
 
 fn extended_client_test() {
     let cache_client = CacheClient::<CacheString, CacheString>::create_connect([127, 0, 0, 1], 8081).unwrap();
-    // let s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
+    let _s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
         // .join().unwrap();
-    // let mut cc_write = cache_client.write().unwrap();
     for i in 1..10 {
         let co = KeyValObj {
             key: CacheString(String::from(format!("key{}", i))),
             val: CacheString(String::from(format!("val{}", i))),
         };
-        println!("int test pushing {:?}", i);
+        println!("test push {:?}", i);
         cache_client.push(co).unwrap();
     }
     
     let mut pull_k: CacheString;
     let mut pull_v: String;
     for i in 1..10 {
-        println!("1pull");
+        // pull_k = CacheString(String::from("key2"));
         pull_k = CacheString(String::from(format!("key{}", i)));
         pull_v = String::from(format!("val{}", i));
         let get_res = cache_client.pull(&pull_k).unwrap();
+        println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
         assert_eq!(get_res.val.0, pull_v);
     }
-    println!("done");
-    // s.join().unwrap();
+    // if let Err(e) = s.join() {
+    //     panic!("{:?}", e);
+    // }
 }
 
 #[test]
 fn extended_server_test() {
     let cache = CacheDb::<CacheString, CacheString>::new([127, 0, 0, 1], 8081);
 
-    cache.write().unwrap().push(KeyValObj {
+    cache.push(KeyValObj {
         key: CacheString(String::from("brian")),
         val: CacheString(String::from("test")),
     });

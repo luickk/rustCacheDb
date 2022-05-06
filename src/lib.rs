@@ -39,15 +39,14 @@ pub struct KeyValObjSync<KeyT, ValT> {
     pub pulling: Mutex<bool>,
     pub pulling_sig: Condvar,
 
-    pub key_pulled: KeyT,
-    pub val_received: ValT,
+    pub key_val: RwLock<KeyValObj<KeyT, ValT>>
 }
 
 pub struct CacheDb<KeyT, ValT> {
     ipv4_addr: [u8; 4],
     port: u16,
 
-    key_val_store: Vec<Box<KeyValObj<KeyT, ValT>>>,
+    key_val_store: RwLock<Vec<Box<KeyValObj<KeyT, ValT>>>>
 }
 
 pub struct CacheProtocol<KeyT, ValT> {
@@ -76,6 +75,7 @@ pub trait GenericKeyVal<Val> {
     fn get_size(&self) -> Result<u16, CacheDbError>;
     fn get_bytes(&self) -> Vec<u8>;
     fn from_bytes(data: &[u8]) -> Result<Val, CacheDbError>;
+    fn empty() -> Val;
 }
 
 impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> + Debug {
@@ -238,13 +238,12 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
         // todo => implement timout
         loop {
             for obj in self.key_val_sync_store.read().unwrap().iter() {
-                if obj.key_pulled == *key {
+                if obj.key_val.read().unwrap().key == *key {
                     let mut _pull_sig_lock = obj.pulling.lock().unwrap();
 
                     // if it is not yet requesting val; we do so
-                    // if is was already requested(obj.pull<ing = true) by somebody else we don't need to repeat
+                    // if is was already requested(obj.pulling = true) by somebody else we don't need to repeat
                     if !*_pull_sig_lock {
-                        println!("Requested");
                         // todo => mem optimization
                         let pull_obj = KeyValObj{key: (*key).clone(), val: ValT::default()};
                         let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &pull_obj)?;
@@ -257,18 +256,21 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                         obj.pulling_sig.notify_one();
                     }
 
+                    // // drop mutex guard so the cache_client_handler can write to it
+                    // drop(obj);
+
                     // waiting for pulling to turn to false
                     // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
-                    // 2. if it was true (obj.pulling), it has been true already which indicates that tere has been a request made by somebody else
-                    while !*_pull_sig_lock {
+                    // 2. if it was true (obj.pulling), it has been true already which indicates that there has been a request made by somebody else
+                    while *_pull_sig_lock {
                         _pull_sig_lock = obj.pulling_sig.wait(_pull_sig_lock).unwrap();
                         // obj.pulling has been set to false by the CacheClientHandler(todo) and can now be read from the key_val_sync_store
-                        return Ok(KeyValObj{key: obj.key_pulled.clone(), val: obj.val_received.clone()});
+                        return Ok(KeyValObj{key: obj.key_val.read().unwrap().key.clone(), val: obj.key_val.read().unwrap().val.clone()});
                     }
                 }
             }
-
-            self.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_pulled: KeyT::default(), val_received: ValT::default()});            
+            // print!("created new one");
+            self.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObj{key: (*key).clone(), val: ValT::default()})});            
         }
     }
 
@@ -294,7 +296,6 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
             let mut buff_left_over_size: usize = 0;
             let mut cloned_socket = ccache_clone.tcp_conn.write().unwrap().try_clone().unwrap();
             'tcp_read: loop {
-                println!("aquired");
                 if buff_left_over_size == 0 {
                     match cloned_socket.read(&mut buff) {
                         Err(_) => return Err(CacheDbError::NetworkError),
@@ -333,18 +334,16 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                         },
                         (parsed, _) if parsed => {
                             // successfully parsed parsed_obj is now updated to latest parsed obj (such as parsed_op_code)
-                            println!("Client handler OpCode: {:?} Key: {:?}, Val: {:?}", parsed_op_code, parsed_obj.key, parsed_obj.val);
                             match parsed_op_code {
                                 ProtOpCode::TerminateConn => {
                                     break 'tcp_read;
                                 },
                                 ProtOpCode::PullReplyOp => {
-                                    for mut obj in ccache_clone.key_val_sync_store.write().unwrap().iter_mut() {
-                                        if obj.key_pulled == parsed_obj.key {
-                                            obj.val_received = parsed_obj.val.clone();
+                                    for obj in ccache_clone.key_val_sync_store.read().unwrap().iter() {
+                                        if obj.key_val.read().unwrap().key == parsed_obj.key {
+                                            obj.key_val.write().unwrap().val = parsed_obj.val.clone();
                                             *obj.pulling.lock().unwrap() = false;
                                             obj.pulling_sig.notify_one();
-                                            println!("updated");
                                         }
                                     }
                                 }
@@ -365,24 +364,24 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
     }
 }
 
-impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + GenericKeyVal<KeyT> + Default + Debug + Send + Sync, ValT: GenericKeyVal<ValT> + Default + Debug + Send + Sync, KeyValObj<KeyT, ValT>: Clone {
-    pub fn new(ipv4_addr: [u8; 4], port: u16) -> Arc<RwLock<CacheDb<KeyT, ValT>>> {
+impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + GenericKeyVal<KeyT> + Default + Debug + Send + Sync + Clone, ValT: GenericKeyVal<ValT> + Default + Debug + Send + Sync, KeyValObj<KeyT, ValT>: Clone {
+    pub fn new(ipv4_addr: [u8; 4], port: u16) -> Arc<CacheDb<KeyT, ValT>> {
         let cache = CacheDb {
             ipv4_addr: ipv4_addr,
             port: port,
-            key_val_store: Vec::new(),
+            key_val_store: RwLock::new(Vec::new()),
         };
-        Arc::new(RwLock::new(cache))
+        Arc::new(cache)
     }
 
-    pub fn push(&mut self, obj: KeyValObj<KeyT, ValT>) {
-        self.key_val_store.push(Box::<KeyValObj<KeyT, ValT>>::new(obj));
+    pub fn push(&self, obj: KeyValObj<KeyT, ValT>) {
+        self.key_val_store.write().unwrap().push(Box::<KeyValObj<KeyT, ValT>>::new(obj));
 
     }
 
     // returning reference since there is a lifetime from the CacheDb(self) struct
     pub fn get(&self, key: &KeyT) -> Option<KeyValObj<KeyT, ValT>> {
-        for obj in self.key_val_store.iter() {
+        for obj in self.key_val_store.read().unwrap().iter() {
             if &obj.key == key {
                 return Some((**obj).clone());
             }
@@ -390,8 +389,8 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + G
         None
     }
 
-    pub fn set(&mut self, key: KeyT, val: ValT) -> Result<(), CacheDbError> {
-        for obj in self.key_val_store.iter_mut() {
+    pub fn set(&self, key: KeyT, val: ValT) -> Result<(), CacheDbError> {
+        for obj in self.key_val_store.write().unwrap().iter_mut() {
             if obj.key == key {
                 obj.val = val;
                 return Ok(());
@@ -400,7 +399,7 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + G
         Err(CacheDbError::KeyNotFound)
     }
 
-    fn client_handler(mut socket: TcpStream, cache: &Arc<RwLock<CacheDb<KeyT, ValT>>>) {
+    fn client_handler(mut socket: TcpStream, cache: &Arc<CacheDb<KeyT, ValT>>) {
         let mut buff = [0; TCP_READ_BUFF_SIZE];
 
         let mut parser = CacheProtocol::<KeyT, ValT>::new();
@@ -445,25 +444,38 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + G
                     },
                     (parsed, _) if parsed => {
                         // successfully parsed parsed_obj is now updated to latest parsed obj (such as parsed_op_code)
-                        println!("OpCode: {:?} Key: {:?}, Val: {:?}", parsed_op_code, parsed_obj.key, parsed_obj.val);
                         match parsed_op_code {
                             ProtOpCode::TerminateConn => {
                                 break 'tcp_read;
                             },
                             ProtOpCode::PushOp => {
-                                cache.write().unwrap().push(parsed_obj.clone());
+                                cache.push(parsed_obj.clone());
                             }
                             ProtOpCode::PullOp => {
-                                if let Some(obj) = cache.read().unwrap().get(&parsed_obj.key) {
-                                    match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &obj) {
-                                        Ok(send_buff) => {
-                                            println!("WROTE! req reply");
-                                            if let Err(_) = socket.write(&send_buff) {
+                                match cache.get(&parsed_obj.key) {
+                                    Some(obj) => {
+                                        match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &obj) {
+                                            Ok(send_buff) => {
+                                                if let Err(_) = socket.write(&send_buff) {
+                                                    break 'tcp_read;
+                                                }       
+                                            },
+                                            Err(_) => {
                                                 break 'tcp_read;
-                                            }       
-                                        },
-                                        Err(_) => {
-                                            break 'tcp_read;
+                                            }
+                                        }    
+                                    }
+                                    None => {
+                                        // todo => implement explicit notFound info
+                                        match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &KeyValObj{key: parsed_obj.key.clone(), val: ValT::empty()}) {
+                                            Ok(send_buff) => {
+                                                if let Err(_) = socket.write(&send_buff) {
+                                                    break 'tcp_read;
+                                                }       
+                                            },
+                                            Err(_) => {
+                                                break 'tcp_read;
+                                            }
                                         }
                                     }
                                 }
@@ -482,12 +494,11 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + G
         }
     }
 
-    pub fn cache_db_server(cache: &Arc<RwLock<CacheDb<KeyT, ValT>>>) -> JoinHandle<io::Result<()>> {
+    pub fn cache_db_server(cache: &Arc<CacheDb<KeyT, ValT>>) -> JoinHandle<io::Result<()>> {
         let cache_clone = Arc::clone(cache);
 
         thread::spawn(move || {
-            let cache_read = cache_clone.read().unwrap();
-            let addr = SocketAddr::from((cache_read.ipv4_addr, cache_read.port));
+            let addr = SocketAddr::from((cache_clone.ipv4_addr, cache_clone.port));
 
             let listener = TcpListener::bind(addr)?;
             loop {
@@ -533,6 +544,10 @@ mod tests {
             }
             Err(CacheDbError::DecodingErr)
         }
+
+        fn empty() -> String {
+            "".to_string()
+        }
     }
 
     fn basic_client_test() {
@@ -547,7 +562,7 @@ mod tests {
         CacheDb::<String, String>::cache_db_server(&cache);
         // .join().unwrap();
 
-        cache.write().unwrap().push(KeyValObj{key: "asd".to_string(), val: "das".to_string()});
+        cache.push(KeyValObj{key: "asd".to_string(), val: "das".to_string()});
         thread::sleep(time::Duration::from_secs(1));
         basic_client_test();
     }
@@ -556,49 +571,49 @@ mod tests {
     fn local_cache_db_test() {
         let cache = CacheDb::<String, String>::new([127, 0, 0, 1], 8080);
 
-        cache.write().unwrap().push(KeyValObj {
+        cache.push(KeyValObj {
             key: String::from("brian"),
             val: String::from("test"),
         });
-        cache.write().unwrap().push(KeyValObj {
+        cache.push(KeyValObj {
             key: String::from("paul"),
             val: String::from("test1"),
         });
-        cache.write().unwrap().push(KeyValObj {
+        cache.push(KeyValObj {
             key: String::from("pete"),
             val: String::from("test2"),
         });
-        cache.write().unwrap().push(KeyValObj {
+        cache.push(KeyValObj {
             key: String::from("robert"),
             val: String::from("test3"),
         });
 
-        let get_res = cache.read().unwrap().get(&String::from("brian")).unwrap();
+        let get_res = cache.get(&String::from("brian")).unwrap();
         assert_eq!(&get_res.val, "test");
         println!("get k: {} v: {}", get_res.key, get_res.val);
 
-        let get_res = cache.read().unwrap().get(&String::from("paul")).unwrap();
+        let get_res = cache.get(&String::from("paul")).unwrap();
         assert_eq!(&get_res.val, "test1");
         println!("get k: {} v: {}", get_res.key, get_res.val);
 
-        let get_res = cache.read().unwrap().get(&String::from("pete")).unwrap();
+        let get_res = cache.get(&String::from("pete")).unwrap();
         assert_eq!(&get_res.val, "test2");
         println!("get k: {} v: {}", get_res.key, get_res.val);
 
-        let get_res = cache.read().unwrap().get(&String::from("robert")).unwrap();
+        let get_res = cache.get(&String::from("robert")).unwrap();
         assert_eq!(&get_res.val, "test3");
         println!("get k: {} v: {}", get_res.key, get_res.val);
 
-        if let None = cache.read().unwrap().get(&String::from("ian")) {
+        if let None = cache.get(&String::from("ian")) {
             println!("Ian not found!");
         } else {
             assert!(true);
         }
 
-        if let Err(_e) = cache.write().unwrap().set(String::from("robert"), String::from("mod_test")) {
+        if let Err(_e) = cache.set(String::from("robert"), String::from("mod_test")) {
             assert!(true);
         }
-        let get_res = cache.read().unwrap().get(&String::from("robert")).unwrap();
+        let get_res = cache.get(&String::from("robert")).unwrap();
         assert_eq!(&get_res.val, "mod_test");
         println!("mod get k: {} v: {}", get_res.key, get_res.val);
     }
