@@ -38,7 +38,7 @@ impl rustcachedb::GenericKeyVal<CacheString> for CacheString {
     }
 }
 
-fn extended_client_test() {
+fn client_test_multiple_keys() {
     let cache_client = CacheClient::<CacheString, CacheString>::create_connect([127, 0, 0, 1], 8081).unwrap();
     let _s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
         // .join().unwrap();
@@ -66,6 +66,62 @@ fn extended_client_test() {
     // }
 }
 
+fn client_test_single_key() {
+    let cache_client = CacheClient::<CacheString, CacheString>::create_connect([127, 0, 0, 1], 8081).unwrap();
+    let _s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
+        // .join().unwrap();
+    
+    let co = KeyValObj {
+        key: CacheString("key".to_string()),
+        val: CacheString("val".to_string()),
+    };
+
+    cache_client.push(co).unwrap();
+    
+    let pull_k = CacheString(String::from("key2"));
+    
+    let cache_client_clone = cache_client.clone();
+    let pull_k_clone = pull_k.clone();
+    thread::spawn(move || {
+        for _ in 1..500 {
+            let _get_res = cache_client_clone.pull(&pull_k_clone).unwrap();
+            // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);cf
+        }
+    });
+    for _ in 1..500 {
+        let _get_res = cache_client.pull(&pull_k).unwrap();
+        // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
+    }
+
+    // if let Err(e) = s.join() {
+    //     panic!("{:?}", e);
+    // }
+}
+
+fn client_test_single_key_async() {
+    let cache_client = CacheClient::<CacheString, CacheString>::create_connect([127, 0, 0, 1], 8081).unwrap();
+    let _s = CacheClient::<CacheString, CacheString>::cache_client_handler(&cache_client);
+        // .join().unwrap();
+    
+    let co = KeyValObj {
+        key: CacheString("key".to_string()),
+        val: CacheString("val".to_string()),
+    };
+
+    cache_client.push(co).unwrap();
+    
+    let pull_k = CacheString(String::from("key2"));
+
+    for _ in 1..500 {
+        let _get_res = CacheClient::pull_async(&cache_client, &pull_k);
+        // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
+    }
+
+    // if let Err(e) = s.join() {
+    //     panic!("{:?}", e);
+    // }
+}
+
 #[test]
 fn extended_server_test() {
     let cache = CacheDb::<CacheString, CacheString>::new([127, 0, 0, 1], 8081);
@@ -79,6 +135,8 @@ fn extended_server_test() {
         // .join().unwrap();
         
     thread::sleep(time::Duration::from_secs(1));
-    extended_client_test();
+    client_test_multiple_keys();
+    client_test_single_key();
+    client_test_single_key_async();
     // cache_db_server.join().unwrap();
 }

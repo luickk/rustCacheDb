@@ -254,10 +254,9 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                         // is set back to negative by the CacheClientHandler on request reply
                         *_pull_sig_lock = true;
                         obj.pulling_sig.notify_one();
+                    } else {
+                        println!("- skipped");
                     }
-
-                    // // drop mutex guard so the cache_client_handler can write to it
-                    // drop(obj);
 
                     // waiting for pulling to turn to false
                     // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
@@ -273,6 +272,51 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
             self.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObj{key: (*key).clone(), val: ValT::default()})});            
         }
     }
+
+    pub fn pull_async(cache_client: &Arc<CacheClient<KeyT, ValT>>, key: &KeyT) -> JoinHandle<Result<KeyValObj<KeyT, ValT>, CacheDbError>> {
+        let cache_client = cache_client.clone();
+        let key = (*key).clone();
+        return thread::spawn(move || {
+            // todo => implement timout
+            loop {
+                for obj in cache_client.key_val_sync_store.read().unwrap().iter() {
+                    if obj.key_val.read().unwrap().key == key {
+                        let mut _pull_sig_lock = obj.pulling.lock().unwrap();
+
+                        // if it is not yet requesting val; we do so
+                        // if is was already requested(obj.pulling = true) by somebody else we don't need to repeat
+                        if !*_pull_sig_lock {
+                            // todo => mem optimization
+                            let pull_obj = KeyValObj{key: key.clone(), val: ValT::default()};
+                            let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &pull_obj)?;
+                            if let Err(_) = cache_client.tcp_conn.write().unwrap().write(&send_buff) {
+                                return Err(CacheDbError::NetworkError);
+                            }
+
+                            // is set back to negative by the CacheClientHandler on request reply
+                            *_pull_sig_lock = true;
+                            obj.pulling_sig.notify_one();
+                        } else {
+                            println!("- async skip");
+                        }
+
+                        // waiting for pulling to turn to false
+                        // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
+                        // 2. if it was true (obj.pulling), it has been true already which indicates that there has been a request made by somebody else
+                        while *_pull_sig_lock {
+                            _pull_sig_lock = obj.pulling_sig.wait(_pull_sig_lock).unwrap();
+                            // todo => implement timeout
+                            // obj.pulling has been set to false by the CacheClientHandler(todo) and can now be read from the key_val_sync_store
+                            return Ok(KeyValObj{key: obj.key_val.read().unwrap().key.clone(), val: obj.key_val.read().unwrap().val.clone()});
+                        }
+                        return Err(CacheDbError::NetworkError);
+                    }
+                }
+                cache_client.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObj{key: key.clone(), val: ValT::default()})});            
+            }
+        });
+    }
+
 
     pub fn terminate_conn(&mut self) -> io::Result<usize> {
         // op_code 4 -> terminate_conn
