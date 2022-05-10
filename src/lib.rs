@@ -5,19 +5,24 @@ use std::marker::PhantomData;
 use std::thread;
 use std::thread::JoinHandle;
 use std::cmp::PartialEq;
+use std::time::Duration;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock, Mutex, Condvar};
 use std::marker::{Send, Sync};
 
 const TCP_READ_BUFF_SIZE: usize = 1024;
+const CACHE_CLIENT_REQ_SIG_WAIT: Duration = Duration::from_secs(10);
 
-#[derive(Debug)]
+// todo => remove potentially unnecessary iterations over the key_val_stores (benchmarks)
+
+#[derive(Debug, PartialEq)]
 pub enum CacheDbError {
     KeyNotFound,
     ParsingErr,
     DecodingErr,
     ProtocolSizeBufferOverflow,
     NetworkError,
+    NetworkTimeOutError
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -25,7 +30,8 @@ pub enum ProtOpCode {
     PullOp = 1,
     PushOp = 2,
     PullReplyOp = 3,
-    TerminateConn = 4,
+    PullReplyNotFoundOp = 4,
+    TerminateConn = 5,
 }
 
 #[derive(Clone, Copy)]
@@ -34,12 +40,14 @@ pub struct KeyValObj<KeyT, ValT> {
     pub val: ValT,
 }
 
+// 0 contains the key_val pair, 1 indicates wether the key could be found 
+pub struct KeyValObjSyncLocked<KeyT, ValT>(KeyValObj<KeyT, ValT>, bool);
 pub struct KeyValObjSync<KeyT, ValT> {
     // only true if data is currently requested (pulled)
     pub pulling: Mutex<bool>,
     pub pulling_sig: Condvar,
 
-    pub key_val: RwLock<KeyValObj<KeyT, ValT>>
+    pub key_val: RwLock<KeyValObjSyncLocked<KeyT, ValT>>
 }
 
 pub struct CacheDb<KeyT, ValT> {
@@ -75,24 +83,25 @@ pub trait GenericKeyVal<Val> {
     fn get_size(&self) -> Result<u16, CacheDbError>;
     fn get_bytes(&self) -> Vec<u8>;
     fn from_bytes(data: &[u8]) -> Result<Val, CacheDbError>;
-    fn empty() -> Val;
 }
 
 impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> + Debug {
     fn prot_op_code_to_u8(op_code: &ProtOpCode) -> u8 {
         match op_code {
-            ProtOpCode::PullOp => 1,
-            ProtOpCode::PushOp => 2,
-            ProtOpCode::PullReplyOp => 3,
-            ProtOpCode::TerminateConn => 4,
+            ProtOpCode::PullOp => u8::from_le(1),
+            ProtOpCode::PushOp => u8::from_le(2),
+            ProtOpCode::PullReplyOp => u8::from_le(3),
+            ProtOpCode::PullReplyNotFoundOp => u8::from_le(4),
+            ProtOpCode::TerminateConn => u8::from_le(5),
         }
     }
     fn u8_to_prot_op_code(op_code: u8) -> Option<ProtOpCode> {
-        match op_code {
+        match u8::from_be(op_code) {
             1 => Some(ProtOpCode::PullOp),
             2 => Some(ProtOpCode::PushOp),
             3 => Some(ProtOpCode::PullReplyOp),
-            4 => Some(ProtOpCode::TerminateConn),
+            4 => Some(ProtOpCode::PullReplyNotFoundOp),
+            5 => Some(ProtOpCode::TerminateConn),
             _ => None,
         }
     }
@@ -100,16 +109,16 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
     pub fn assemble_buff(op_code: ProtOpCode, obj: &KeyValObj<KeyT, ValT>) -> Result<Vec<u8>, CacheDbError> {
         let mut buff = Vec::<u8>::new();
         buff.push(CacheProtocol::<KeyT, ValT>::prot_op_code_to_u8(&op_code));
-        let key_size = obj.key.get_size()?.to_be_bytes();
-        buff.extend_from_slice(&key_size);
+        let key_size = obj.key.get_size()?;
+        buff.extend_from_slice(&u16::from_le(key_size).to_be_bytes());
         let mut key_bytes = obj.key.get_bytes();
         buff.append(&mut key_bytes);
 
-        let mut val_size: [u8; 2] = [0, 0];
         if op_code != ProtOpCode::PullOp {
-            val_size = obj.val.get_size()?.to_be_bytes();
+            buff.extend_from_slice(&u16::from_le(obj.val.get_size()?).to_be_bytes());
+        } else {
+            buff.extend_from_slice(&[0_u8, 0_u8]);
         }
-        buff.extend_from_slice(&val_size);
         if op_code != ProtOpCode::PullOp {
             let mut val_bytes = obj.val.get_bytes();
             buff.append(&mut val_bytes);
@@ -234,42 +243,45 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
         Ok(())
     }
 
-    pub fn pull(&self, key: &KeyT) -> Result<KeyValObj<KeyT, ValT>, CacheDbError> {
-        // todo => implement timout
+    pub fn pull(&self, key: &KeyT, res: &mut KeyValObj<KeyT, ValT>) -> Result<(), CacheDbError> {
         loop {
             for obj in self.key_val_sync_store.read().unwrap().iter() {
-                if obj.key_val.read().unwrap().key == *key {
+                if obj.key_val.read().unwrap().0.key == *key {
                     let mut _pull_sig_lock = obj.pulling.lock().unwrap();
 
                     // if it is not yet requesting val; we do so
                     // if is was already requested(obj.pulling = true) by somebody else we don't need to repeat
                     if !*_pull_sig_lock {
-                        // todo => mem optimization
-                        let pull_obj = KeyValObj{key: (*key).clone(), val: ValT::default()};
-                        let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &pull_obj)?;
+                        let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &KeyValObj{key: (*key).clone(), val: ValT::default()})?;
                         if let Err(_) = self.tcp_conn.write().unwrap().write(&send_buff) {
                             return Err(CacheDbError::NetworkError);
                         }
 
-                        // is set back to negative by the CacheClientHandler on request reply
+                        // is set back to negative by the cache_client_handler on request reply
                         *_pull_sig_lock = true;
                         obj.pulling_sig.notify_one();
-                    } else {
-                        println!("- skipped");
                     }
 
                     // waiting for pulling to turn to false
                     // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
                     // 2. if it was true (obj.pulling), it has been true already which indicates that there has been a request made by somebody else
                     while *_pull_sig_lock {
-                        _pull_sig_lock = obj.pulling_sig.wait(_pull_sig_lock).unwrap();
-                        // obj.pulling has been set to false by the CacheClientHandler(todo) and can now be read from the key_val_sync_store
-                        return Ok(KeyValObj{key: obj.key_val.read().unwrap().key.clone(), val: obj.key_val.read().unwrap().val.clone()});
+                        let _pull_sig_lock = obj.pulling_sig.wait_timeout(_pull_sig_lock, CACHE_CLIENT_REQ_SIG_WAIT).unwrap();
+                        if _pull_sig_lock.1.timed_out() {
+                            return Err(CacheDbError::NetworkTimeOutError);
+                        }
+                        if obj.key_val.read().unwrap().1 {
+                            return Err(CacheDbError::KeyNotFound);
+                        }
+
+                        // obj.pulling has been set to false by the cache_client_handler and can now be read from the key_val_sync_store
+                        *res = KeyValObj{key: obj.key_val.read().unwrap().0.key.clone(), val: obj.key_val.read().unwrap().0.val.clone()};
+                        return Ok(());
                     }
                 }
             }
             // print!("created new one");
-            self.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObj{key: (*key).clone(), val: ValT::default()})});            
+            self.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObjSyncLocked(KeyValObj{key: (*key).clone(), val: ValT::default()}, false))});            
         }
     }
 
@@ -277,42 +289,39 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
         let cache_client = cache_client.clone();
         let key = (*key).clone();
         return thread::spawn(move || {
-            // todo => implement timout
             loop {
                 for obj in cache_client.key_val_sync_store.read().unwrap().iter() {
-                    if obj.key_val.read().unwrap().key == key {
+                    if obj.key_val.read().unwrap().0.key == key {
                         let mut _pull_sig_lock = obj.pulling.lock().unwrap();
 
                         // if it is not yet requesting val; we do so
                         // if is was already requested(obj.pulling = true) by somebody else we don't need to repeat
                         if !*_pull_sig_lock {
-                            // todo => mem optimization
-                            let pull_obj = KeyValObj{key: key.clone(), val: ValT::default()};
-                            let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &pull_obj)?;
+                            let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &KeyValObj{key: key.clone(), val: ValT::default()})?;
                             if let Err(_) = cache_client.tcp_conn.write().unwrap().write(&send_buff) {
                                 return Err(CacheDbError::NetworkError);
                             }
 
-                            // is set back to negative by the CacheClientHandler on request reply
+                            // is set back to negative by the cache_client_handler on request reply
                             *_pull_sig_lock = true;
                             obj.pulling_sig.notify_one();
-                        } else {
-                            println!("- async skip");
                         }
 
                         // waiting for pulling to turn to false
                         // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
                         // 2. if it was true (obj.pulling), it has been true already which indicates that there has been a request made by somebody else
                         while *_pull_sig_lock {
-                            _pull_sig_lock = obj.pulling_sig.wait(_pull_sig_lock).unwrap();
-                            // todo => implement timeout
-                            // obj.pulling has been set to false by the CacheClientHandler(todo) and can now be read from the key_val_sync_store
-                            return Ok(KeyValObj{key: obj.key_val.read().unwrap().key.clone(), val: obj.key_val.read().unwrap().val.clone()});
+                            let _pull_sig_lock = obj.pulling_sig.wait_timeout(_pull_sig_lock, CACHE_CLIENT_REQ_SIG_WAIT).unwrap();
+                            if _pull_sig_lock.1.timed_out() {
+                                return Err(CacheDbError::NetworkTimeOutError);
+                            }
+                            // obj.pulling has been set to false by the cache_client_handler and can now be read from the key_val_sync_store
+                            return Ok(KeyValObj{key: obj.key_val.read().unwrap().0.key.clone(), val: obj.key_val.read().unwrap().0.val.clone()});
                         }
                         return Err(CacheDbError::NetworkError);
                     }
                 }
-                cache_client.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObj{key: key.clone(), val: ValT::default()})});            
+                cache_client.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObjSyncLocked(KeyValObj{key: key.clone(), val: ValT::default()}, false))});
             }
         });
     }
@@ -382,15 +391,18 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                                 ProtOpCode::TerminateConn => {
                                     break 'tcp_read;
                                 },
-                                ProtOpCode::PullReplyOp => {
+                                ProtOpCode::PullReplyOp | ProtOpCode::PullReplyNotFoundOp => {
                                     for obj in ccache_clone.key_val_sync_store.read().unwrap().iter() {
-                                        if obj.key_val.read().unwrap().key == parsed_obj.key {
-                                            obj.key_val.write().unwrap().val = parsed_obj.val.clone();
+                                        if obj.key_val.read().unwrap().0.key == parsed_obj.key {
+                                            obj.key_val.write().unwrap().0.val = parsed_obj.val.clone();
+                                            if parsed_op_code == ProtOpCode::PullReplyNotFoundOp {
+                                                obj.key_val.write().unwrap().1 = true;
+                                            }
                                             *obj.pulling.lock().unwrap() = false;
                                             obj.pulling_sig.notify_one();
                                         }
                                     }
-                                }
+                                },
                                 _ => {
                                     break 'tcp_read;
                                 }
@@ -510,8 +522,7 @@ impl<KeyT: 'static, ValT: 'static> CacheDb<KeyT, ValT> where KeyT: PartialEq + G
                                         }    
                                     }
                                     None => {
-                                        // todo => implement explicit notFound info
-                                        match CacheProtocol::assemble_buff(ProtOpCode::PullReplyOp, &KeyValObj{key: parsed_obj.key.clone(), val: ValT::empty()}) {
+                                        match CacheProtocol::assemble_buff(ProtOpCode::PullReplyNotFoundOp, &KeyValObj{key: parsed_obj.key.clone(), val: ValT::default()}) {
                                             Ok(send_buff) => {
                                                 if let Err(_) = socket.write(&send_buff) {
                                                     break 'tcp_read;
@@ -588,16 +599,17 @@ mod tests {
             }
             Err(CacheDbError::DecodingErr)
         }
-
-        fn empty() -> String {
-            "".to_string()
-        }
     }
 
     fn basic_client_test() {
         let cache_client = CacheClient::<String, String>::create_connect([127, 0, 0, 1], 8080).unwrap();
         CacheClient::<String, String>::cache_client_handler(&cache_client);
         // .join().unwrap();
+
+        let mut _test_res = KeyValObj{key: String::new(), val: String::new()};
+        cache_client.pull(&"asd".to_string(), &mut _test_res).unwrap();
+
+        assert_eq!(CacheDbError::KeyNotFound, cache_client.pull(&"non_existant".to_string(), &mut _test_res).unwrap_err());
     }
 
     #[test]

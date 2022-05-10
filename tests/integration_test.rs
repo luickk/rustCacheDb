@@ -32,10 +32,6 @@ impl rustcachedb::GenericKeyVal<CacheString> for CacheString {
         }
         Err(CacheDbError::DecodingErr)
     }
-
-    fn empty() -> CacheString {
-        CacheString("".to_string())
-    }
 }
 
 fn client_test_multiple_keys() {
@@ -47,18 +43,19 @@ fn client_test_multiple_keys() {
             key: CacheString(String::from(format!("key{}", i))),
             val: CacheString(String::from(format!("val{}", i))),
         };
-        println!("test push {:?}", i);
+        // println!("test push {:?}", i);
         cache_client.push(co).unwrap();
     }
     
     let mut pull_k: CacheString;
     let mut pull_v: String;
+    let mut get_res = KeyValObj{key: CacheString(String::new()), val: CacheString(String::new())};
     for i in 1..10 {
         // pull_k = CacheString(String::from("key2"));
         pull_k = CacheString(String::from(format!("key{}", i)));
         pull_v = String::from(format!("val{}", i));
-        let get_res = cache_client.pull(&pull_k).unwrap();
-        println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
+        cache_client.pull(&pull_k, &mut get_res).unwrap();
+        // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
         assert_eq!(get_res.val.0, pull_v);
     }
     // if let Err(e) = s.join() {
@@ -83,15 +80,22 @@ fn client_test_single_key() {
     let cache_client_clone = cache_client.clone();
     let pull_k_clone = pull_k.clone();
     thread::spawn(move || {
+        let mut i = 0;
+        let mut get_res = KeyValObj{key: CacheString(String::new()), val: CacheString(String::new())};  
         for _ in 1..500 {
-            let _get_res = cache_client_clone.pull(&pull_k_clone).unwrap();
-            // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);cf
+            cache_client_clone.pull(&pull_k_clone, &mut get_res).unwrap();
+            // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
+            i += 1;        
         }
+        assert_eq!(499, i);
     });
+    let mut get_res = KeyValObj{key: CacheString(String::new()), val: CacheString(String::new())};
+    let mut i = 0;
     for _ in 1..500 {
-        let _get_res = cache_client.pull(&pull_k).unwrap();
-        // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
+        cache_client.pull(&pull_k, &mut get_res).unwrap();
+        i += 1;
     }
+    assert_eq!(499, i);
 
     // if let Err(e) = s.join() {
     //     panic!("{:?}", e);
@@ -112,10 +116,13 @@ fn client_test_single_key_async() {
     
     let pull_k = CacheString(String::from("key2"));
 
+    let mut i = 0;
     for _ in 1..500 {
         let _get_res = CacheClient::pull_async(&cache_client, &pull_k);
-        // println!("received: {:}, {:}", get_res.key.0, get_res.val.0);
+        i += 1;
+        // join thread and wait
     }
+    assert_eq!(499, i);
 
     // if let Err(e) = s.join() {
     //     panic!("{:?}", e);
