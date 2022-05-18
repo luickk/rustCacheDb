@@ -86,7 +86,7 @@ pub trait GenericKeyVal<Val> {
 }
 
 impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT: GenericKeyVal<ValT> + Debug {
-    fn prot_op_code_to_u8(op_code: &ProtOpCode) -> u8 {
+    fn prot_op_code_to_u8_be(op_code: &ProtOpCode) -> u8 {
         match op_code {
             ProtOpCode::PullOp => u8::from_le(1),
             ProtOpCode::PushOp => u8::from_le(2),
@@ -95,7 +95,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
             ProtOpCode::TerminateConn => u8::from_le(5),
         }
     }
-    fn u8_to_prot_op_code(op_code: u8) -> Option<ProtOpCode> {
+    fn u8_to_prot_op_code_le(op_code: u8) -> Option<ProtOpCode> {
         match u8::from_be(op_code) {
             1 => Some(ProtOpCode::PullOp),
             2 => Some(ProtOpCode::PushOp),
@@ -108,7 +108,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
 
     pub fn assemble_buff(op_code: ProtOpCode, obj: &KeyValObj<KeyT, ValT>) -> Result<Vec<u8>, CacheDbError> {
         let mut buff = Vec::<u8>::new();
-        buff.push(CacheProtocol::<KeyT, ValT>::prot_op_code_to_u8(&op_code));
+        buff.push(CacheProtocol::<KeyT, ValT>::prot_op_code_to_u8_be(&op_code));
         let key_size = obj.key.get_size()?;
         buff.extend_from_slice(&u16::from_le(key_size).to_be_bytes());
         let mut key_bytes = obj.key.get_bytes();
@@ -152,7 +152,7 @@ impl<KeyT, ValT> CacheProtocol<KeyT, ValT> where KeyT: GenericKeyVal<KeyT>, ValT
                     self.to_parse_bytes_total +=1;
                     op_code_raw = buff[self.parsed_bytes_total];
 
-                    if let Some(op_code_en) = &CacheProtocol::<KeyT, ValT>::u8_to_prot_op_code(op_code_raw) {
+                    if let Some(op_code_en) = &CacheProtocol::<KeyT, ValT>::u8_to_prot_op_code_le(op_code_raw) {
                         op_code.clone_from(op_code_en);
                     } else {
                         return Err(CacheDbError::ParsingErr);

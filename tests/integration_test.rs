@@ -1,5 +1,3 @@
-extern crate rustcachedb;
-
 use std::thread;
 use std::time;
 use rustcachedb::{CacheDb, CacheClient, CacheDbError, KeyValObj};
