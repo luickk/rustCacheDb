@@ -11,6 +11,14 @@ This concept guarantees that the data is as up to date as possible(if speed is o
 
 #### Optimization Performance
 
+##### Timing
+
+I've written a very similiar (functionally and architecture wise) project in C (can be found (here)[https://github.com/luickk/tempCacheDb/blob/main/src/tempCacheDb.c]) which takes 55 μs(micross.) per pull request. 
+
+This projects achieves 15 μs through this optimisation.
+
+##### Numbers
+
 - The `pull_async` function "skips" (instead waits for the pull reply already sent) *402/500* requests. That means that instead of 500 requests, only 100 were made. That's 90% less.
 - If the data is pulled synchronously from two thread 498/500 are skipped. So instead of 500, only two requests were actually made. 
 
@@ -18,7 +26,7 @@ This concept guarantees that the data is as up to date as possible(if speed is o
 
 Regular cost flow: 
 
-`request send(buffer assemble; tcp write) -> cache client handler waits & parses incoming data (actual parse; linear search by key to write to correct "requestor")` 
+`request send(buffer assemble; tcp write) -> cache client handler waits & parses incoming data (actual parse; linear search by key to write to correct requesting client/server)` 
 
 Optimized cost flow: 
 

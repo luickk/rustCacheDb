@@ -250,7 +250,7 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                     let mut _pull_sig_lock = obj.pulling.lock().unwrap();
 
                     // if it is not yet requesting val; we do so
-                    // if is was already requested(obj.pulling = true) by somebody else we don't need to repeat
+                    // if it was already requested(obj.pulling = true) by somebody else we don't need to do so again
                     if !*_pull_sig_lock {
                         let send_buff = CacheProtocol::assemble_buff(ProtOpCode::PullOp, &KeyValObj{key: (*key).clone(), val: ValT::default()})?;
                         if let Err(_) = self.tcp_conn.write().unwrap().write(&send_buff) {
@@ -260,10 +260,10 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                         // is set back to negative by the cache_client_handler on request reply
                         *_pull_sig_lock = true;
                         obj.pulling_sig.notify_one();
-                    }
+                    } 
 
                     // waiting for pulling to turn to false
-                    // if block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
+                    // if-block above ensures that this loop is reached 1. only if there has been a request made by this method (if !obj.pulling) or
                     // 2. if it was true (obj.pulling), it has been true already which indicates that there has been a request made by somebody else
                     while *_pull_sig_lock {
                         let _pull_sig_lock = obj.pulling_sig.wait_timeout(_pull_sig_lock, CACHE_CLIENT_REQ_SIG_WAIT).unwrap();
@@ -280,7 +280,6 @@ impl<KeyT: 'static, ValT: 'static> CacheClient<KeyT, ValT> where KeyT: GenericKe
                     }
                 }
             }
-            // print!("created new one");
             self.key_val_sync_store.write().unwrap().push(KeyValObjSync{pulling: Mutex::new(false), pulling_sig: Condvar::new(), key_val: RwLock::new(KeyValObjSyncLocked(KeyValObj{key: (*key).clone(), val: ValT::default()}, false))});            
         }
     }
